@@ -18,3 +18,7 @@ exp1/results/errors/
 # Old files waiting for manual deletion
 _to_delete/
 **/_to_delete/
+
+# Exp 1 checkpoints and mechanism-check errors
+exp1/results/ckpt/
+exp1/results/derot/

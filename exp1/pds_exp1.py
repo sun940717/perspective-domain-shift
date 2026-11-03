@@ -37,6 +37,7 @@ Usage / 用法
     python pds_exp1.py prepare --dataroot ../exp0/nuscenes --out data
     python pds_exp1.py render  --data data
     python pds_exp1.py run     --data data --out results
+    python pds_exp1.py derot   --data data --out results      (A1 mechanism check / 機制檢驗)
     python pds_exp1.py report  --results results
 
 Python 3.10; needs torch, torchvision, numpy, pandas, pillow, opencv-python, matplotlib
@@ -365,8 +366,13 @@ def cmd_render(args: argparse.Namespace) -> None:
 class CropDS:
     """Module-level for Windows DataLoader workers. 定義在模組層級以支援 Windows 多程序。"""
 
-    def __init__(self, df: pd.DataFrame, root: Path, frame: str, train: bool, size: int):
+    def __init__(self, df: pd.DataFrame, root: Path, frame: str, train: bool, size: int,
+                 rotate_deg: np.ndarray | None = None):
         from torchvision import transforms as T
+
+        # rotate_deg: counter-clockwise image rotation per crop (PIL convention). Rotating by +roll
+        # undoes a camera roll (verified on synthetic crops). 每個裁切的逆時針旋轉角；+roll 可抵銷相機側傾。
+        self.rot = None if rotate_deg is None else np.asarray(rotate_deg, dtype=np.float64)
 
         norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         self.paths = [root / "crops" / f for f in df["file"]]
@@ -388,7 +394,10 @@ class CropDS:
         import torch
         from PIL import Image
 
-        return self.tf(Image.open(self.paths[i]).convert("RGB")), torch.from_numpy(self.y[i]), i
+        img = Image.open(self.paths[i]).convert("RGB")
+        if self.rot is not None and self.rot[i] != 0:
+            img = img.rotate(float(self.rot[i]), resample=Image.BILINEAR)
+        return self.tf(img), torch.from_numpy(self.y[i]), i
 
 
 def torch_R_from_r6(x):
@@ -450,11 +459,11 @@ def train_model(train_df, root, frame, args, device, seed):
     return m
 
 
-def predict(m, df, root, frame, args, device) -> np.ndarray:
+def predict(m, df, root, frame, args, device, rotate_deg=None) -> np.ndarray:
     import torch
     from torch.utils.data import DataLoader
 
-    dl = DataLoader(CropDS(df, root, frame, False, args.size), batch_size=args.bs * 2,
+    dl = DataLoader(CropDS(df, root, frame, False, args.size, rotate_deg), batch_size=args.bs * 2,
                     shuffle=False, num_workers=args.workers)
     out = np.zeros((len(df), 6 if frame == "allo" else 2))
     m.eval()
@@ -509,6 +518,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                 t0 = time.time()
                 print(f"[fold {k}] {proto:5s} {frame:5s} train={len(tr)} test={len(test_df)}")
                 m = train_model(tr, root, frame, args, device, args.seed + k)
+                (out / "ckpt").mkdir(exist_ok=True)
+                torch.save(m.state_dict(), out / "ckpt" / f"{proto}_{frame}_fold{k}.pt")
                 pred = predict(m, test_df, root, frame, args, device)
                 ev = evaluate(frame, pred, test_df, np.random.default_rng(args.seed + k))
                 ev.insert(0, "fold", k); ev.insert(0, "frame", frame); ev.insert(0, "protocol", proto)
@@ -519,20 +530,97 @@ def cmd_run(args: argparse.Namespace) -> None:
     print("\nDone. Next: python pds_exp1.py report --results", out)
 
 
+def load_or_train(path: Path, tr, root, frame, args, device, seed):
+    """Reuse a saved checkpoint, else train and save it. 有檢查點就重用，否則訓練並儲存。"""
+    import torch
+    import torch.nn as nn
+    from torchvision.models import resnet18
+
+    if path.exists():
+        m = resnet18(weights=None)
+        m.fc = nn.Linear(m.fc.in_features, 6 if frame == "allo" else 2)
+        m.load_state_dict(torch.load(path, map_location=device))
+        return m.to(device)
+    m = train_model(tr, root, frame, args, device, seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(m.state_dict(), path)
+    return m
+
+
+def cmd_derot(args: argparse.Namespace) -> None:
+    """A1 mechanism check: level-trained models on roll-tilted crops, with and without rotating
+    each crop back upright by the TRUE roll (an oracle). If de-rotation restores the level error,
+    in-plane image rotation is the cause of the roll damage.
+    A1 機制檢驗：水平訓練的模型在側傾裁切上推論，比較「原樣」與「依真實側傾轉回直立」（神諭）。
+    若轉正後誤差回到水平值，即證實側傾損害來自影像平面內旋轉。"""
+    import torch
+
+    root, out = Path(args.data), Path(args.out)
+    (out / "derot").mkdir(parents=True, exist_ok=True)
+    idx = pd.read_csv(root / "index.csv")
+    idx = idx[idx.complete].reset_index(drop=True)
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    folds = make_folds(idx.scene.unique().tolist(), args.folds)
+    if args.max_folds:
+        folds = folds[:args.max_folds]
+    for k, held in enumerate(folds):
+        tr = idx[~idx.scene.isin(held) & (idx.cond == "p+0_r+0")].reset_index(drop=True)
+        te = idx[idx.scene.isin(held) & (idx.split == "test") & (idx.pitch == 0)].reset_index(drop=True)
+        for frame in args.frames or ["cam", "alpha", "allo"]:
+            f = out / "derot" / f"{frame}_fold{k}.csv.gz"
+            if f.exists() and not args.overwrite:
+                print(f"[skip] {f.name}")
+                continue
+            t0 = time.time()
+            m = load_or_train(out / "ckpt" / f"level_{frame}_fold{k}.pt", tr, root, frame, args, device, args.seed + k)
+            gt = te.level_yaw.to_numpy()
+            parts = []
+            for mode, rot in [("plain", None), ("derot", te.roll.to_numpy())]:
+                pred = predict(m, te, root, frame, args, device, rot)
+                if mode == "derot":
+                    # The upright crop now matches the level labels, so decode against the level ray.
+                    # 轉正後的裁切對應水平標籤，因此以水平視線解碼。
+                    lv = idx[idx.scene.isin(held) & (idx.cond == "p+0_r+0")].set_index("uid")
+                    dfd = te[["uid"]].join(lv[["dx", "dy", "dz"]], on="uid")
+                else:
+                    dfd = te
+                yaw = decode(frame, pred, dfd, "none")
+                parts.append(pd.DataFrame({"uid": te.uid, "roll": te.roll, "mode": mode,
+                                           "err_deg": np.degrees(np.abs(wrap(yaw - gt))).round(3)}))
+            r = pd.concat(parts, ignore_index=True)
+            r.insert(0, "fold", k); r.insert(0, "frame", frame)
+            r.to_csv(f, index=False)
+            g = r.groupby(["mode", "roll"]).err_deg.mean()
+            print(f"[fold {k}] {frame:5s} level={g[('plain', 0.0)]:.1f}  roll±20 plain="
+                  f"{(g[('plain', 20.0)] + g[('plain', -20.0)]) / 2:.1f}  derot="
+                  f"{(g[('derot', 20.0)] + g[('derot', -20.0)]) / 2:.1f}  ({time.time() - t0:.0f}s)")
+    print("\nDone. Next: python pds_exp1.py report --results", out)
+
+
 # =========================================================================== #
 # Stage 4: report / 報告
 # =========================================================================== #
-def tolerance(curve: pd.Series, level: float, factor: float = 1.5) -> float:
-    """Largest |angle| up to which mean error stays <= factor * level error (both signs).
-    誤差維持在水平誤差 factor 倍以內的最大傾斜角（正負兩側都要符合）。"""
-    best = 0.0
-    for a in sorted({abs(x) for x in curve.index if x != 0}):
-        vals = [curve.get(a), curve.get(-a)]
-        if all(v is not None and v <= factor * level for v in vals):
-            best = a
-        else:
-            break
-    return best
+FRAME_STYLE = {  # validated categorical slots 1-3 + distinct markers (colour is never the only cue)
+    "cam": ("#2a78d6", "o"), "alpha": ("#eb6834", "s"), "allo": ("#1baf7a", "^")}
+
+
+def paired_delta(e: pd.DataFrame, conds: list[tuple[float, float]]) -> pd.Series:
+    """Per-fold mean error at `conds` minus the SAME objects' level error.
+    每折：同一批物體在 conds 的平均誤差減去水平誤差。"""
+    f = e.groupby(["fold", "pitch", "roll"]).err_deg.mean()
+    out = {}
+    for k in sorted(e.fold.unique()):
+        keys = [(k, float(p), float(r)) for p, r in conds]
+        if (k, 0.0, 0.0) not in f.index or any(key not in f.index for key in keys):
+            continue                                   # angle not rendered on this grid / 此格點未產生該角度
+        out[k] = np.mean([f[key] for key in keys]) - f[(k, 0.0, 0.0)]
+    return pd.Series(out, dtype=float)
+
+
+def ms(x: pd.Series) -> str:
+    if len(x) == 0:
+        return "—"
+    return f"{x.mean():+.1f} ± {x.std():.1f}" if len(x) > 1 else f"{x.mean():+.1f}"
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -545,45 +633,128 @@ def cmd_report(args: argparse.Namespace) -> None:
     if not files:
         raise SystemExit("No results yet. Run `run` first.")
     e = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-    e["acc30"] = (e.err_deg <= 30).astype(float)
-    e["method"] = e.frame + "/" + e.decoder
-    lines = ["# PDS Experiment 1 — Label frame × camera tilt / 標籤座標系 × 攝影機傾斜", "",
-             f"Folds: {e.fold.nunique()} · objects per fold avg: {int(e.groupby('fold').uid.nunique().mean())}", ""]
-    for proto in sorted(e.protocol.unique()):
-        ep = e[e.protocol == proto]
-        lines += [f"## Protocol: {proto}", "",
-                  "| method | level err (°) | pitch tolerance (°) | roll tolerance (°) | err @ max pitch | err @ max roll |",
-                  "|---|---|---|---|---|---|"]
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
-        for method, g in ep.groupby("method"):
-            fold_curve = g.groupby(["fold", "pitch", "roll"]).err_deg.mean().reset_index()
-            mean = fold_curve.groupby(["pitch", "roll"]).err_deg.mean()
-            level = mean.get((0.0, 0.0), np.nan)
-            pc = mean.xs(0.0, level="roll")
-            rc = mean.xs(0.0, level="pitch")
-            bp, br = max(abs(x) for x in pc.index), max(abs(x) for x in rc.index)
-            lines.append(f"| {method} | {level:.1f} | {tolerance(pc, level):.0f} | {tolerance(rc, level):.0f} | "
-                         f"{np.nanmean([pc.get(bp), pc.get(-bp)]):.1f} | "
-                         f"{np.nanmean([rc.get(br), rc.get(-br)]):.1f} |")
-            ls = "--" if "ext" in method else "-"
-            axes[0].plot(pc.index, pc.values, ls, marker="o", ms=3, label=method)
-            axes[1].plot(rc.index, rc.values, ls, marker="o", ms=3, label=method)
-        for ax, t in zip(axes, ["pitch (deg)", "roll (deg)"]):
-            ax.set_xlabel(f"camera {t}")
-            ax.grid(alpha=0.3)
-        axes[0].set_ylabel("mean heading error (deg)")
-        axes[1].legend(fontsize=7, ncol=2)
-        fig.suptitle(f"PDS Exp 1 — protocol: {proto}")
-        fig.tight_layout()
-        fig.savefig(res / f"tilt_{proto}.png", dpi=150)
-        plt.close(fig)
-        lines += ["", f"![tilt curves {proto}](tilt_{proto}.png)", ""]
-    lines += ["Tolerance = largest |tilt| at which mean error stays within 1.5× the level error on both sides.",
-              "容忍度 = 兩側平均誤差都維持在水平誤差 1.5 倍以內的最大傾斜角。",
-              "", "`ext` decoders use known extrinsics (upper bound, RQ3); `none`/`grav` do not.",
-              "`ext` 解碼器使用已知外參（上限，RQ3）；`none`／`grav` 不使用外參。"]
-    (res / "summary.md").write_text("\n".join(lines), encoding="utf-8")
-    print("\n".join(lines))
+    nf = e.fold.nunique()
+    sym = lambda a, axis: [(a, 0.0), (-a, 0.0)] if axis == "pitch" else [(0.0, a), (0.0, -a)]
+    L = ["# PDS Experiment 1 — Label frame × camera tilt / 標籤座標系 × 攝影機傾斜", "",
+         f"{nf} folds · {e.uid.nunique()} objects · every number below is PAIRED: error at tilt minus the "
+         "same objects' error with a level camera, mean ± std over folds.",
+         f"共 {nf} 折、{e.uid.nunique()} 個物體。下表皆為配對差：傾斜下誤差減去同一批物體在水平相機下的誤差（各折平均 ± 標準差）。", ""]
+
+    # Table 1: degradation per frame (decoder = none)
+    L += ["## 1. Degradation under tilt, extrinsics unknown / 傾斜造成的退化（外參未知）", "",
+          "| protocol | frame | level err (°) | pitch ±5 | pitch ±15 | roll ±5 | roll ±12 | roll ±20 |",
+          "|---|---|---|---|---|---|---|---|"]
+    none = e[e.decoder == "none"]
+    for proto in [p for p in PROTOCOLS if p in set(e.protocol)]:
+        for fr in [f for f in FRAMES if f in set(e.frame)]:
+            g = none[(none.protocol == proto) & (none.frame == fr)]
+            lvl = g[(g.pitch == 0) & (g.roll == 0)].groupby("fold").err_deg.mean()
+            cells = [ms(paired_delta(g, sym(a, ax))) for ax, a in
+                     [("pitch", 5), ("pitch", 15), ("roll", 5), ("roll", 12), ("roll", 20)]]
+            spread = f" ± {lvl.std():.1f}" if len(lvl) > 1 else ""
+            L.append(f"| {proto} | {fr} | {lvl.mean():.1f}{spread} | " + " | ".join(cells) + " |")
+    L += ["", "`world` is at chance (~90°) everywhere, so its deltas carry no information.",
+          "`world` 在所有條件下都接近隨機（約 90°），其差值不具資訊量。", ""]
+
+    # Table 2: paired frame differences at roll ±20, per fold
+    L += ["## 2. Does the frame change roll robustness? / 座標系是否改變側傾穩健性？", "",
+          "Per-fold difference in roll ±20° degradation (negative = first frame more robust).",
+          "各折在側傾 ±20° 下退化量的差（負值代表前者較穩健）。", "",
+          "| protocol | comparison | per fold | mean | folds favouring first |", "|---|---|---|---|---|"]
+    for proto in [p for p in PROTOCOLS if p in set(e.protocol)]:
+        d = {fr: paired_delta(none[(none.protocol == proto) & (none.frame == fr)], sym(20, "roll"))
+             for fr in ("cam", "alpha", "allo") if fr in set(e.frame)}
+        for a, b in [("alpha", "cam"), ("allo", "alpha"), ("allo", "cam")]:
+            if a in d and b in d:
+                diff = d[a] - d[b]
+                L.append(f"| {proto} | {a} − {b} | " + ", ".join(f"{x:+.1f}" for x in diff) +
+                         f" | {diff.mean():+.1f} | {(diff < 0).sum()}/{len(diff)} |")
+    L.append("")
+
+    # Table 3: decoders at roll ±20
+    L += ["## 3. Does knowing the extrinsics help? / 已知外參是否有幫助？", "",
+          "Roll ±20° degradation by decoder. / 各解碼方式在側傾 ±20° 的退化量。", "",
+          "| protocol | frame | none | grav | ext | ext_noisy |", "|---|---|---|---|---|---|"]
+    for proto in [p for p in PROTOCOLS if p in set(e.protocol)]:
+        for fr in ("cam", "alpha", "allo"):
+            row = []
+            for dec in ("none", "grav", "ext", "ext_noisy"):
+                g = e[(e.protocol == proto) & (e.frame == fr) & (e.decoder == dec)]
+                row.append(ms(paired_delta(g, sym(20, "roll"))) if len(g) else "—")
+            L.append(f"| {proto} | {fr} | " + " | ".join(row) + " |")
+    L.append("")
+
+    # Figure: degradation curves, rows = protocol, cols = pitch / roll
+    protos = [p for p in PROTOCOLS if p in set(e.protocol)]
+    fig, axes = plt.subplots(len(protos), 2, figsize=(10, 3.6 * len(protos)), sharey=True, squeeze=False)
+    for i, proto in enumerate(protos):
+        for j, axis in enumerate(["pitch", "roll"]):
+            ax = axes[i][j]
+            ends = []
+            for fr, (col, mk) in FRAME_STYLE.items():
+                g = none[(none.protocol == proto) & (none.frame == fr)]
+                if not len(g):
+                    continue
+                other = "roll" if axis == "pitch" else "pitch"
+                angles = sorted(g[g[other] == 0][axis].unique())
+                mu, sd = [], []
+                for a in angles:
+                    d = paired_delta(g, [(a, 0.0)] if axis == "pitch" else [(0.0, a)])
+                    mu.append(d.mean()); sd.append(d.std() if len(d) > 1 else 0.0)
+                mu, sd = np.array(mu), np.array(sd)
+                ax.fill_between(angles, mu - sd, mu + sd, color=col, alpha=0.12, linewidth=0)
+                ax.plot(angles, mu, color=col, marker=mk, markersize=4, linewidth=2, label=fr)
+                ends.append([mu[-1], fr, angles[-1]])
+            ends.sort()                        # spread end labels so they never overlap / 錯開尾端標籤
+            for n in range(1, len(ends)):
+                ends[n][0] = max(ends[n][0], ends[n - 1][0] + 3.0)
+            for y, fr, x in ends:
+                ax.annotate(fr, (x, y), xytext=(5, 0), textcoords="offset points",
+                            fontsize=9, color="#52514e", va="center")
+            ax.axhline(0, color="#bdbbb5", linewidth=1)
+            ax.grid(axis="y", color="#e8e7e3", linewidth=0.8)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            ax.set_xlabel(f"camera {axis} (deg)")
+            ax.set_title(f"{proto} training · {axis}", fontsize=10, loc="left", color="#0b0b0b")
+        axes[i][0].set_ylabel("extra heading error vs level (deg)")
+    axes[0][1].legend(frameon=False, fontsize=9, loc="upper center")
+    fig.suptitle("Roll, not pitch, degrades heading, and every label frame degrades alike",
+                 fontsize=12, x=0.01, ha="left")
+    fig.tight_layout()
+    fig.savefig(res / "tilt_degradation.png", dpi=160)
+    plt.close(fig)
+    L += ["## 4. Degradation curves / 退化曲線", "", "![degradation](tilt_degradation.png)", "",
+          "Lines: mean over folds; bands: ±1 std over folds; decoder = none.",
+          "線：各折平均；色帶：各折 ±1 標準差；解碼方式 = none。"]
+    dfiles = sorted((res / "derot").glob("*.csv.gz")) if (res / "derot").exists() else []
+    if dfiles:
+        d = pd.concat([pd.read_csv(f) for f in dfiles], ignore_index=True)
+        L += ["", "## 5. A1 mechanism check: rotate rolled crops back upright / 機制檢驗：把側傾裁切轉回直立", "",
+              "Level-trained models. `derot` rotates each crop by the TRUE roll before inference (oracle).",
+              "水平訓練的模型。`derot` 在推論前依真實側傾把裁切轉回（神諭）。", "",
+              "| frame | level err (°) | roll ±12 plain | roll ±12 derot | roll ±20 plain | roll ±20 derot |",
+              "|---|---|---|---|---|---|"]
+        for fr in ("cam", "alpha", "allo"):
+            g = d[d.frame == fr]
+            if not len(g):
+                continue
+            lvl = g[(g["mode"] == "plain") & (g.roll == 0)].groupby("fold").err_deg.mean()
+            cells = []
+            for a in (12, 20):
+                for mode in ("plain", "derot"):
+                    h = g[g["mode"] == mode].rename(columns={})
+                    h = h.assign(pitch=0.0)
+                    lv0 = g[(g["mode"] == "plain") & (g.roll == 0)].assign(pitch=0.0)
+                    hh = pd.concat([h[h.roll != 0], lv0])
+                    cells.append(ms(paired_delta(hh, [(0.0, float(a)), (0.0, float(-a))])))
+            L.append(f"| {fr} | {lvl.mean():.1f} | " + " | ".join(cells) + " |")
+        L += ["", "Numbers are extra error vs the same objects with a level camera. A `derot` value near 0 means "
+              "in-plane rotation explains the roll damage. Rotated crops gain black corners, a small extra handicap.",
+              "數值為與同一批物體水平相機相比多出的誤差。`derot` 接近 0 代表影像平面內旋轉可解釋側傾損害。"
+              "轉正後的裁切角落會出現黑邊，是一個小額外不利因素。"]
+    (res / "summary.md").write_text("\n".join(L), encoding="utf-8")
+    print("\n".join(L))
 
 
 # =========================================================================== #
@@ -705,6 +876,24 @@ def main() -> None:
     u.add_argument("--overwrite", action="store_true")
     u.add_argument("--verbose", action="store_true")
     u.set_defaults(func=cmd_run)
+
+    dr = sub.add_parser("derot", help="A1 mechanism check: de-rotate rolled crops (oracle)")
+    dr.add_argument("--data", default="data")
+    dr.add_argument("--out", default="results")
+    dr.add_argument("--folds", type=int, default=5)
+    dr.add_argument("--max-folds", type=int, default=0)
+    dr.add_argument("--epochs", type=int, default=12)
+    dr.add_argument("--bs", type=int, default=64)
+    dr.add_argument("--lr", type=float, default=3e-4)
+    dr.add_argument("--size", type=int, default=128)
+    dr.add_argument("--workers", type=int, default=2)
+    dr.add_argument("--seed", type=int, default=0)
+    dr.add_argument("--frames", nargs="*", choices=FRAMES)
+    dr.add_argument("--no-pretrained", dest="pretrained", action="store_false")
+    dr.add_argument("--cpu", action="store_true")
+    dr.add_argument("--overwrite", action="store_true")
+    dr.add_argument("--verbose", action="store_true")
+    dr.set_defaults(func=cmd_derot)
 
     q = sub.add_parser("report")
     q.add_argument("--results", default="results")

@@ -47,13 +47,17 @@ echo [4/5] Training 4 frames x 2 protocols x 5 folds, resumable / 訓練 40 次�
 "%PY%" pds_exp1.py run --data data --out results --workers 2
 if errorlevel 1 goto :fail
 
+echo [4b] A1 mechanism check: de-rotate rolled crops, about 15 min / 機制檢驗：把側傾裁切轉回，約 15 分鐘...
+"%PY%" pds_exp1.py derot --data data --out results --workers 2
+if errorlevel 1 goto :fail
+
 echo [5/5] Building report / 產生報告...
 "%PY%" pds_exp1.py report --results results
 if errorlevel 1 goto :fail
 
 echo.
-echo Done. See results\summary.md, results\tilt_level.png, results\tilt_aug.png
-echo 完成。請看 results\summary.md、results\tilt_level.png、results\tilt_aug.png
+echo Done. See results\summary.md and results\tilt_degradation.png
+echo 完成。請看 results\summary.md 與 results\tilt_degradation.png
 explorer results
 pause
 exit /b 0
