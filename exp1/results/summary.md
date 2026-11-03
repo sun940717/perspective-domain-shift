@@ -66,3 +66,17 @@ Level-trained models. `derot` rotates each crop by the TRUE roll before inferenc
 
 Numbers are extra error vs the same objects with a level camera. A `derot` value near 0 means in-plane rotation explains the roll damage. Rotated crops gain black corners, a small extra handicap.
 數值為與同一批物體水平相機相比多出的誤差。`derot` 接近 0 代表影像平面內旋轉可解釋側傾損害。轉正後的裁切角落會出現黑邊，是一個小額外不利因素。
+
+## 6. A1b de-rotation with a noisy roll estimate / 以含誤差的側傾估計轉正
+
+Each crop is rotated by (true roll + N(0, σ)); level crops are rotated by the noise alone. Extra error vs the same objects, level camera, NO rotation. Mean ± std over folds.
+每個裁切依（真實側傾 + 常態誤差 σ）旋轉；水平裁切只依誤差旋轉。數值為相對於同一批物體、水平相機、不旋轉時多出的誤差（各折平均 ± 標準差）。
+
+| frame | σ=0° level | σ=0° roll ±20 | σ=1° level | σ=1° roll ±20 | σ=2° level | σ=2° roll ±20 | σ=5° level | σ=5° roll ±20 |
+|---|---|---|---|---|---|---|---|---|
+| cam | +0.0 ± 0.0 | +1.2 ± 7.1 | -0.6 ± 1.0 | +1.1 ± 6.9 | -0.7 ± 1.5 | +1.5 ± 6.5 | +0.9 ± 2.1 | +4.0 ± 6.3 |
+| alpha | +0.0 ± 0.0 | +3.1 ± 5.1 | -0.1 ± 1.0 | +3.3 ± 4.6 | +0.9 ± 1.2 | +3.2 ± 4.0 | +3.5 ± 0.3 | +5.3 ± 2.6 |
+| allo | +0.0 ± 0.0 | +0.5 ± 7.2 | -1.1 ± 1.0 | +0.3 ± 7.1 | +0.1 ± 2.1 | +0.9 ± 6.9 | +1.8 ± 4.0 | +3.6 ± 5.3 |
+
+For reference, roll ±20° WITHOUT any de-rotation costs about +19–21° (section 5).
+對照：完全不轉正時，側傾 ±20° 約多出 +19–21°（見第 5 節）。

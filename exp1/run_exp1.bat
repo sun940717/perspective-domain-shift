@@ -51,6 +51,10 @@ echo [4b] A1 mechanism check: de-rotate rolled crops, about 15 min / 機制檢�
 "%PY%" pds_exp1.py derot --data data --out results --workers 2
 if errorlevel 1 goto :fail
 
+echo [4c] A1b noisy-roll de-rotation, about 10 min / 含誤差側傾轉正，約 10 分鐘...
+"%PY%" pds_exp1.py derotnoise --data data --out results --workers 2
+if errorlevel 1 goto :fail
+
 echo [5/5] Building report / 產生報告...
 "%PY%" pds_exp1.py report --results results
 if errorlevel 1 goto :fail

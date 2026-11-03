@@ -22,3 +22,4 @@ _to_delete/
 # Exp 1 checkpoints and mechanism-check errors
 exp1/results/ckpt/
 exp1/results/derot/
+exp1/results/derot_noise/

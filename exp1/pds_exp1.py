@@ -38,6 +38,7 @@ Usage / 用法
     python pds_exp1.py render  --data data
     python pds_exp1.py run     --data data --out results
     python pds_exp1.py derot   --data data --out results      (A1 mechanism check / 機制檢驗)
+    python pds_exp1.py derotnoise --data data --out results   (A1b noisy roll / 含誤差側傾)
     python pds_exp1.py report  --results results
 
 Python 3.10; needs torch, torchvision, numpy, pandas, pillow, opencv-python, matplotlib
@@ -597,6 +598,53 @@ def cmd_derot(args: argparse.Namespace) -> None:
     print("\nDone. Next: python pds_exp1.py report --results", out)
 
 
+def cmd_derotnoise(args: argparse.Namespace) -> None:
+    """A1b: de-rotate with a NOISY roll estimate (roll + N(0, sigma)), as an IMU or horizon
+    estimate would give. Level crops (roll 0) are also rotated by the noise alone, since a
+    real system would apply its (noisy) correction to every frame.
+    A1b：以含誤差的側傾估計（真實側傾 + 常態誤差）轉正，模擬 IMU 或地平線估計。水平裁切也只依誤差旋轉，
+    因為實際系統會對每一張影像套用（含誤差的）修正。"""
+    import torch
+
+    root, out = Path(args.data), Path(args.out)
+    (out / "derot_noise").mkdir(parents=True, exist_ok=True)
+    idx = pd.read_csv(root / "index.csv")
+    idx = idx[idx.complete].reset_index(drop=True)
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    folds = make_folds(idx.scene.unique().tolist(), args.folds)
+    if args.max_folds:
+        folds = folds[:args.max_folds]
+    for k, held in enumerate(folds):
+        tr = idx[~idx.scene.isin(held) & (idx.cond == "p+0_r+0")].reset_index(drop=True)
+        te = idx[idx.scene.isin(held) & (idx.split == "test") & (idx.pitch == 0)].reset_index(drop=True)
+        lv = idx[idx.scene.isin(held) & (idx.cond == "p+0_r+0")].set_index("uid")
+        dfd = te[["uid"]].join(lv[["dx", "dy", "dz"]], on="uid")
+        gt = te.level_yaw.to_numpy()
+        for frame in args.frames or ["cam", "alpha", "allo"]:
+            f = out / "derot_noise" / f"{frame}_fold{k}.csv.gz"
+            if f.exists() and not args.overwrite:
+                print(f"[skip] {f.name}")
+                continue
+            t0 = time.time()
+            m = load_or_train(out / "ckpt" / f"level_{frame}_fold{k}.pt", tr, root, frame, args, device, args.seed + k)
+            parts = []
+            for sigma in args.noise:
+                rng = np.random.default_rng(1000 * k + int(10 * sigma))   # same noise for every frame
+                rot = te.roll.to_numpy() + rng.normal(0.0, sigma, len(te))
+                pred = predict(m, te, root, frame, args, device, rot)
+                yaw = decode(frame, pred, dfd, "none")
+                parts.append(pd.DataFrame({"uid": te.uid, "roll": te.roll, "sigma": sigma,
+                                           "err_deg": np.degrees(np.abs(wrap(yaw - gt))).round(3)}))
+            r = pd.concat(parts, ignore_index=True)
+            r.insert(0, "fold", k); r.insert(0, "frame", frame)
+            r.to_csv(f, index=False)
+            g = r.groupby(["sigma", "roll"]).err_deg.mean()
+            msg = "  ".join(f"s={sg:g}: lvl={g[(sg, 0.0)]:.1f} r20={(g[(sg, 20.0)] + g[(sg, -20.0)]) / 2:.1f}"
+                            for sg in args.noise)
+            print(f"[fold {k}] {frame:5s} {msg}  ({time.time() - t0:.0f}s)")
+    print("\nDone. Next: python pds_exp1.py report --results", out)
+
+
 # =========================================================================== #
 # Stage 4: report / 報告
 # =========================================================================== #
@@ -753,6 +801,31 @@ def cmd_report(args: argparse.Namespace) -> None:
               "in-plane rotation explains the roll damage. Rotated crops gain black corners, a small extra handicap.",
               "數值為與同一批物體水平相機相比多出的誤差。`derot` 接近 0 代表影像平面內旋轉可解釋側傾損害。"
               "轉正後的裁切角落會出現黑邊，是一個小額外不利因素。"]
+    nfiles = sorted((res / "derot_noise").glob("*.csv.gz")) if (res / "derot_noise").exists() else []
+    if nfiles:
+        d = pd.concat([pd.read_csv(f) for f in nfiles], ignore_index=True)
+        sigmas = sorted(d.sigma.unique())
+        L += ["", "## 6. A1b de-rotation with a noisy roll estimate / 以含誤差的側傾估計轉正", "",
+              "Each crop is rotated by (true roll + N(0, σ)); level crops are rotated by the noise alone. "
+              "Extra error vs the same objects, level camera, NO rotation. Mean ± std over folds.",
+              "每個裁切依（真實側傾 + 常態誤差 σ）旋轉；水平裁切只依誤差旋轉。數值為相對於同一批物體、"
+              "水平相機、不旋轉時多出的誤差（各折平均 ± 標準差）。", "",
+              "| frame | " + " | ".join(f"σ={s:g}° level | σ={s:g}° roll ±20" for s in sigmas) + " |",
+              "|---|" + "---|---|" * len(sigmas)]
+        for fr in ("cam", "alpha", "allo"):
+            g = d[d.frame == fr]
+            if not len(g):
+                continue
+            base = g[(g.sigma == 0) & (g.roll == 0)].groupby("fold").err_deg.mean()
+            cells = []
+            for sg in sigmas:
+                h = g[g.sigma == sg].groupby(["fold", "roll"]).err_deg.mean()
+                lvl = pd.Series({k: h[(k, 0.0)] - base[k] for k in base.index})
+                r20 = pd.Series({k: (h[(k, 20.0)] + h[(k, -20.0)]) / 2 - base[k] for k in base.index})
+                cells += [ms(lvl), ms(r20)]
+            L.append(f"| {fr} | " + " | ".join(cells) + " |")
+        L += ["", "For reference, roll ±20° WITHOUT any de-rotation costs about +19–21° (section 5).",
+              "對照：完全不轉正時，側傾 ±20° 約多出 +19–21°（見第 5 節）。"]
     (res / "summary.md").write_text("\n".join(L), encoding="utf-8")
     print("\n".join(L))
 
@@ -894,6 +967,21 @@ def main() -> None:
     dr.add_argument("--overwrite", action="store_true")
     dr.add_argument("--verbose", action="store_true")
     dr.set_defaults(func=cmd_derot)
+
+    dn = sub.add_parser("derotnoise", help="A1b: de-rotation with a noisy roll estimate")
+    for a, kw in [("--data", dict(default="data")), ("--out", dict(default="results")),
+                  ("--folds", dict(type=int, default=5)), ("--max-folds", dict(type=int, default=0)),
+                  ("--epochs", dict(type=int, default=12)), ("--bs", dict(type=int, default=64)),
+                  ("--lr", dict(type=float, default=3e-4)), ("--size", dict(type=int, default=128)),
+                  ("--workers", dict(type=int, default=2)), ("--seed", dict(type=int, default=0)),
+                  ("--noise", dict(type=float, nargs="*", default=[0.0, 1.0, 2.0, 5.0]))]:
+        dn.add_argument(a, **kw)
+    dn.add_argument("--frames", nargs="*", choices=FRAMES)
+    dn.add_argument("--no-pretrained", dest="pretrained", action="store_false")
+    dn.add_argument("--cpu", action="store_true")
+    dn.add_argument("--overwrite", action="store_true")
+    dn.add_argument("--verbose", action="store_true")
+    dn.set_defaults(func=cmd_derotnoise)
 
     q = sub.add_parser("report")
     q.add_argument("--results", default="results")
