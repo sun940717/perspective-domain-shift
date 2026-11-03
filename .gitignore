@@ -1,0 +1,20 @@
+# nuScenes data: license forbids redistribution / 授權禁止再散布
+exp0/nuscenes/
+exp0/crops/
+*.tgz
+
+# Python env & caches
+exp0/.venv/
+__pycache__/
+*.pyc
+
+# Training outputs: keep summary + plot + folds, ignore bulky per-run preds
+exp0/results/preds/
+
+# Exp 1 rendered crops and per-run errors
+exp1/data/
+exp1/results/errors/
+
+# Old files waiting for manual deletion
+_to_delete/
+**/_to_delete/

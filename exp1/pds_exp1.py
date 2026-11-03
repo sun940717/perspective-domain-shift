@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PDS Experiment 1 — Does the label frame matter under camera tilt?
+PDS 實驗 1 —— 攝影機傾斜時，標籤座標系重要嗎？
+
+Question / 問題
+    A heading model is trained on level cameras (nuScenes). At test time the camera
+    pitches or rolls and its extrinsics are UNKNOWN. How much heading accuracy does
+    each label frame keep?
+    朝向模型在水平相機（nuScenes）上訓練。測試時攝影機俯仰或側傾，且外參「未知」。
+    每種標籤座標系能保留多少朝向準確度？
+
+Label frames / 標籤座標系
+    world : yaw in the global annotation frame                     世界座標 yaw
+    cam   : yaw in the (possibly tilted) camera frame              相機座標 yaw
+    alpha : cam yaw minus the horizontal angle of the pixel ray     觀測角（像素視線）
+    allo  : full 3D rotation relative to the pixel-ray frame (6D)   完整 allocentric 旋轉（6D）
+
+Decoders (how a prediction becomes a heading) / 解碼方式
+    none      : extrinsics unknown, camera assumed level            外參未知，假設相機水平
+    grav      : allo only — the object's own up-axis estimates gravity  僅 allo：以物體上方向估計重力
+    ext       : exact extrinsics known (upper bound, RQ3)            外參精確已知（上限，RQ3）
+    ext_noisy : extrinsics known with N(0, 2 deg) error (RQ3)        外參含 2° 高斯誤差（RQ3）
+
+Protocols / 協定
+    level : train on level crops only                                只用水平裁切訓練
+    aug   : train on level + randomly tilted crops (|pitch|<=15, |roll|<=20 deg)  水平 + 隨機傾斜裁切
+
+Camera tilt is simulated EXACTLY: a pure camera rotation R is the image warp
+H = K R K^-1, independent of scene depth; 3D labels rotate with the same R.
+攝影機傾斜以精確方式模擬：純旋轉 R 對應影像變形 H = K R K^-1，與場景深度無關；
+3D 標籤以同一個 R 旋轉。
+
+Usage / 用法
+    python pds_exp1.py selftest
+    python pds_exp1.py prepare --dataroot ../exp0/nuscenes --out data
+    python pds_exp1.py render  --data data
+    python pds_exp1.py run     --data data --out results
+    python pds_exp1.py report  --results results
+
+Python 3.10; needs torch, torchvision, numpy, pandas, pillow, opencv-python, matplotlib
+(+ nuscenes-devkit for `prepare`).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+FRAMES = ["world", "cam", "alpha", "allo"]
+PROTOCOLS = ["level", "aug"]
+CAMS = ["CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
+        "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
+# nuScenes cameras see only ~39 deg vertically (fy~1266 px, 900 px tall): beyond ~15 deg of
+# pitch, cars near the horizon leave the frame. Roll keeps them in view up to 20 deg.
+# nuScenes 相機垂直視野僅約 39°：俯仰超過約 15° 時，地平線附近的車會離開畫面；側傾到 20° 仍在畫面內。
+PITCH_FULL = [0, 1, 2, 3, 5, 8, 12, 15]
+ROLL_FULL = [0, 1, 2, 3, 5, 8, 12, 16, 20]
+PITCH_SMALL = [0, 5, 12]
+ROLL_SMALL = [0, 5, 20]
+AUG_MAX_PITCH, AUG_MAX_ROLL = 15.0, 20.0
+EXT_NOISE_DEG = 2.0
+
+
+# =========================================================================== #
+# Geometry (numpy, vectorised) / 幾何工具（numpy 向量化）
+# Camera frame: x right, y down, z forward.  Box frame: x forward, y left, z up.
+# 相機座標：x 右、y 下、z 前。物體框座標：x 前、y 左、z 上。
+# =========================================================================== #
+def wrap(a):
+    return (np.asarray(a) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def rot_x(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+
+
+def rot_z(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+
+
+def tilt_matrix(pitch_deg: float, roll_deg: float) -> np.ndarray:
+    """Rotation applied to camera-frame points when the camera tilts.
+    相機傾斜時作用在相機座標點上的旋轉。"""
+    return rot_z(math.radians(roll_deg)) @ rot_x(math.radians(pitch_deg))
+
+
+def tilt_matrices(pitch_deg: np.ndarray, roll_deg: np.ndarray) -> np.ndarray:
+    return np.stack([tilt_matrix(p, r) for p, r in zip(pitch_deg, roll_deg)])
+
+
+def yaw_of(h: np.ndarray) -> np.ndarray:
+    """Camera-frame yaw of heading vector(s) (..., 3). 航向向量的相機座標 yaw。"""
+    return np.arctan2(h[..., 0], h[..., 2])
+
+
+def ray_rotation(d: np.ndarray) -> np.ndarray:
+    """Minimal rotation(s) taking +z to unit ray(s) d, shape (N,3) -> (N,3,3).
+    把 +z 轉到視線 d 的最小旋轉。"""
+    d = d / np.linalg.norm(d, axis=-1, keepdims=True)
+    n = d.shape[0]
+    v = np.stack([-d[:, 1], d[:, 0], np.zeros(n)], axis=-1)  # e_z x d
+    s2 = (v ** 2).sum(-1)
+    c = d[:, 2]
+    vx = np.zeros((n, 3, 3))
+    vx[:, 0, 1], vx[:, 0, 2] = -v[:, 2], v[:, 1]
+    vx[:, 1, 0], vx[:, 1, 2] = v[:, 2], -v[:, 0]
+    vx[:, 2, 0], vx[:, 2, 1] = -v[:, 1], v[:, 0]
+    k = np.where(s2 > 1e-12, (1.0 - c) / np.maximum(s2, 1e-12), 0.5)
+    return np.eye(3)[None] + vx + (vx @ vx) * k[:, None, None]
+
+
+def r6_from_R(R: np.ndarray) -> np.ndarray:
+    """First two columns -> 6D. 取前兩欄作為 6D 表示。"""
+    return np.concatenate([R[..., :, 0], R[..., :, 1]], axis=-1)
+
+
+def R_from_r6(x: np.ndarray) -> np.ndarray:
+    """Gram-Schmidt 6D -> rotation (N,3,3). 6D 經 Gram-Schmidt 轉回旋轉矩陣。"""
+    a1, a2 = x[:, :3], x[:, 3:6]
+    b1 = a1 / np.linalg.norm(a1, axis=-1, keepdims=True)
+    a2 = a2 - (b1 * a2).sum(-1, keepdims=True) * b1
+    b2 = a2 / np.linalg.norm(a2, axis=-1, keepdims=True)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=-1)
+
+
+def gravity_yaw(O: np.ndarray) -> np.ndarray:
+    """Yaw measured in a gravity frame estimated from the object's own up-axis.
+    以物體自身的上方向估計重力座標系，並在其中量測 yaw。"""
+    down = -O[:, :, 2]
+    down = down / np.linalg.norm(down, axis=-1, keepdims=True)
+    ez = np.array([0.0, 0.0, 1.0])
+    zg = ez[None] - (down @ ez)[:, None] * down
+    zg = zg / np.linalg.norm(zg, axis=-1, keepdims=True)
+    xg = np.cross(down, zg)
+    h = O[:, :, 0]
+    return np.arctan2((h * xg).sum(-1), (h * zg).sum(-1))
+
+
+def pixel_rays(u: np.ndarray, v: np.ndarray, fx, fy, cx, cy) -> np.ndarray:
+    d = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones_like(u)], axis=-1)
+    return d / np.linalg.norm(d, axis=-1, keepdims=True)
+
+
+def box_corners(c: np.ndarray, O: np.ndarray, wlh: np.ndarray) -> np.ndarray:
+    """3x8 corners in camera frame (nuScenes convention). 相機座標下的 8 個角點。"""
+    w, l, h = wlh
+    x = l / 2 * np.array([1, 1, 1, 1, -1, -1, -1, -1])
+    y = w / 2 * np.array([1, -1, -1, 1, 1, -1, -1, 1])
+    z = h / 2 * np.array([1, 1, -1, -1, 1, 1, -1, -1])
+    return O @ np.vstack([x, y, z]) + c[:, None]
+
+
+def labels_for(R: np.ndarray, O: np.ndarray, d_pix: np.ndarray) -> dict:
+    """Labels of each frame for tilted rotation R@O seen along pixel ray d_pix.
+    在傾斜 R 下、沿像素視線 d_pix 觀察時，各座標系的標籤。"""
+    Ot = R @ O
+    cam = float(yaw_of(Ot[:, 0]))
+    ray = float(math.atan2(d_pix[0], d_pix[2]))
+    alpha = float(wrap(cam - ray))
+    allo = ray_rotation(d_pix[None])[0].T @ Ot
+    return {"cam_yaw": cam, "alpha": alpha, **{f"a{i}": float(x) for i, x in enumerate(r6_from_R(allo))}}
+
+
+# =========================================================================== #
+# Decoding predictions to a level-frame heading / 把預測解碼成水平座標系的朝向
+# =========================================================================== #
+def decode(frame: str, pred: np.ndarray, df: pd.DataFrame, mode: str,
+           R_known: np.ndarray | None = None) -> np.ndarray:
+    """pred: (N,2) sin/cos for yaw frames or (N,6) for allo. Returns yaw (N,).
+    For world: returns world yaw. Others: yaw in the LEVEL camera frame.
+    world 回傳世界 yaw；其餘回傳「水平」相機座標系的 yaw。"""
+    d = df[["dx", "dy", "dz"]].to_numpy()
+    if frame == "world":
+        return np.arctan2(pred[:, 0], pred[:, 1])
+    if frame in ("cam", "alpha"):
+        y = np.arctan2(pred[:, 0], pred[:, 1])
+        if frame == "alpha":
+            y = wrap(y + np.arctan2(d[:, 0], d[:, 2]))
+        if mode == "none":
+            return y
+        return yaw_from_tilted_yaw(y, R_known)
+    # allo
+    O = ray_rotation(d) @ R_from_r6(pred)
+    if mode == "none":
+        return yaw_of(O[:, :, 0])
+    if mode == "grav":
+        return gravity_yaw(O)
+    return yaw_of(np.einsum("nji,njk->nik", R_known, O)[:, :, 0])  # (R^T O) x-axis
+
+
+def yaw_from_tilted_yaw(y_t: np.ndarray, R: np.ndarray) -> np.ndarray:
+    """Level heading whose yaw in the tilted camera equals y_t (exact, extrinsics known).
+    A tilted-frame yaw only fixes a plane of directions; intersect it with the ground plane.
+    找出在傾斜相機中 yaw 等於 y_t 的水平航向（外參已知時的精確解）。
+    傾斜座標的 yaw 只決定一個方向平面；將它與地面相交。"""
+    n_t = np.stack([np.cos(y_t), np.zeros_like(y_t), -np.sin(y_t)], axis=-1)  # plane normal, tilted frame
+    m = np.einsum("nji,nj->ni", R, n_t)                                       # R^T n_t, level frame
+    th = np.arctan2(-m[:, 2], m[:, 0])
+    h = np.stack([np.sin(th), np.zeros_like(th), np.cos(th)], axis=-1)
+    flip = np.abs(wrap(yaw_of(np.einsum("nij,nj->ni", R, h)) - y_t)) > np.pi / 2
+    return wrap(th + np.pi * flip)
+
+
+def decoders_for(frame: str) -> list[str]:
+    if frame == "world":
+        return ["none"]
+    if frame == "allo":
+        return ["none", "grav", "ext", "ext_noisy"]
+    return ["none", "ext", "ext_noisy"]
+
+
+# =========================================================================== #
+# Stage 1: prepare — nuScenes -> geometry table / 從 nuScenes 建立幾何資料表
+# =========================================================================== #
+def cmd_prepare(args: argparse.Namespace) -> None:
+    from nuscenes.nuscenes import NuScenes
+    from nuscenes.utils.geometry_utils import BoxVisibility, view_points
+
+    nusc = NuScenes(version=args.version, dataroot=args.dataroot, verbose=True)
+    root = Path(args.dataroot).resolve()
+    rows = []
+    for si, sample in enumerate(nusc.sample):
+        scene = nusc.get("scene", sample["scene_token"])["name"]
+        for cam in CAMS:
+            img_path, boxes, K = nusc.get_sample_data(sample["data"][cam], box_vis_level=BoxVisibility.ALL)
+            K = np.asarray(K)
+            for box in boxes:
+                if not box.name.startswith(args.category):
+                    continue
+                ann = nusc.get("sample_annotation", box.token)
+                if ann["visibility_token"] not in ("3", "4") or ann["num_lidar_pts"] < args.min_lidar_pts:
+                    continue
+                if box.center[2] <= 0.5:
+                    continue
+                cs = view_points(box.corners(), K, normalize=True)[:2]
+                if max(cs[0].ptp(), cs[1].ptp()) < args.min_size:
+                    continue
+                O = box.orientation.rotation_matrix
+                rows.append({
+                    "uid": f"{box.token}_{cam}", "scene": scene, "cam": cam,
+                    "img": str(Path(img_path).resolve().relative_to(root)).replace("\\", "/"),
+                    "fx": K[0, 0], "fy": K[1, 1], "cx": K[0, 2], "cy": K[1, 2],
+                    "c0": box.center[0], "c1": box.center[1], "c2": box.center[2],
+                    **{f"o{i}": float(x) for i, x in enumerate(O.reshape(-1))},
+                    "w": box.wlh[0], "l": box.wlh[1], "h": box.wlh[2],
+                    "world_yaw": float(nusc.get_box(box.token).orientation.yaw_pitch_roll[0]),
+                })
+        if (si + 1) % 50 == 0:
+            print(f"  samples {si + 1}/{len(nusc.sample)}  objects={len(rows)}")
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    meta = pd.DataFrame(rows)
+    meta.to_csv(out / "geometry.csv", index=False)
+    (out / "dataroot.txt").write_text(str(root), encoding="utf-8")
+    print(f"Saved {len(meta)} objects -> {out / 'geometry.csv'}")
+
+
+# =========================================================================== #
+# Stage 2: render — exact tilt warps / 以精確變形產生傾斜裁切
+# =========================================================================== #
+def conditions(pitch_grid: list[int], roll_grid: list[int]) -> list[tuple[float, float]]:
+    """Pitch-only and roll-only sweeps sharing the level point. 俯仰與側傾各自掃描。"""
+    c = [(0.0, 0.0)]
+    for a in pitch_grid[1:]:
+        c += [(float(-a), 0.0), (float(a), 0.0)]
+    for a in roll_grid[1:]:
+        c += [(0.0, float(-a)), (0.0, float(a))]
+    return c
+
+
+def cond_name(p: float, r: float) -> str:
+    return f"p{p:+.0f}_r{r:+.0f}"
+
+
+def render_one(img: np.ndarray, row: pd.Series, R: np.ndarray, size: int, min_inside: float):
+    """Returns (crop, info) or (None, None) if the object leaves the view.
+    回傳裁切與資訊；物體離開畫面則回傳 None。"""
+    import cv2
+
+    H_img, W_img = img.shape[:2]
+    K = np.array([[row.fx, 0, row.cx], [0, row.fy, row.cy], [0, 0, 1.0]])
+    Kinv = np.linalg.inv(K)
+    c = np.array([row.c0, row.c1, row.c2])
+    O = np.array([row[f"o{i}"] for i in range(9)]).reshape(3, 3)
+    corners = R @ box_corners(c, O, np.array([row.w, row.l, row.h]))
+    if corners[2].min() <= 0.3:
+        return None, None
+    uv = (K @ corners)[:2] / corners[2]
+    x0, y0 = uv.min(1)
+    x1, y1 = uv.max(1)
+    cu, cv_ = (x0 + x1) / 2, (y0 + y1) / 2
+    if not (0 <= cu < W_img and 0 <= cv_ < H_img):
+        return None, None
+    s = max(x1 - x0, y1 - y0) * 1.15 / 2
+    g = (np.arange(size) + 0.5) / size * 2 * s - s
+    gu, gv = np.meshgrid(cu + g, cv_ + g)
+    pts = np.stack([gu.ravel(), gv.ravel(), np.ones(gu.size)])
+    src = K @ R.T @ Kinv @ pts                       # tilted pixel -> original pixel
+    mx = (src[0] / src[2]).reshape(size, size).astype(np.float32)
+    my = (src[1] / src[2]).reshape(size, size).astype(np.float32)
+    inside = ((mx >= 0) & (mx < W_img) & (my >= 0) & (my < H_img)).mean()
+    if inside < min_inside:
+        return None, None
+    crop = cv2.remap(img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    d_pix = pixel_rays(np.array([cu]), np.array([cv_]), row.fx, row.fy, row.cx, row.cy)[0]
+    info = {"u": cu, "v": cv_, "dx": d_pix[0], "dy": d_pix[1], "dz": d_pix[2],
+            "level_yaw": float(yaw_of(O[:, 0])), **labels_for(R, O, d_pix)}
+    return crop, info
+
+
+def cmd_render(args: argparse.Namespace) -> None:
+    import cv2
+
+    data = Path(args.data)
+    geo = pd.read_csv(data / "geometry.csv")
+    dataroot = Path(args.dataroot or (data / "dataroot.txt").read_text(encoding="utf-8").strip())
+    conds = conditions(PITCH_SMALL, ROLL_SMALL) if args.grid == "small" else conditions(PITCH_FULL, ROLL_FULL)
+    rng = np.random.default_rng(args.seed)
+    (data / "crops").mkdir(exist_ok=True)
+    rows, t0 = [], time.time()
+    groups = list(geo.groupby("img"))
+    for gi, (img_rel, g) in enumerate(groups):
+        img = cv2.imread(str(dataroot / img_rel))
+        if img is None:
+            raise FileNotFoundError(dataroot / img_rel)
+        for _, row in g.iterrows():
+            jobs = [("test", p, r) for p, r in conds]
+            jobs += [("aug", rng.uniform(-AUG_MAX_PITCH, AUG_MAX_PITCH), rng.uniform(-AUG_MAX_ROLL, AUG_MAX_ROLL))
+                     for _ in range(args.aug_copies)]
+            for k, (split, p, r) in enumerate(jobs):
+                crop, info = render_one(img, row, tilt_matrix(p, r), args.size, args.min_inside)
+                if crop is None:
+                    continue
+                name = f"{row.uid}_{split}{k}.jpg"
+                cv2.imwrite(str(data / "crops" / name), crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                rows.append({"uid": row.uid, "scene": row.scene, "cam": row.cam, "split": split,
+                             "cond": cond_name(p, r) if split == "test" else "aug",
+                             "pitch": p, "roll": r, "file": name, "world_yaw": row.world_yaw, **info})
+        if (gi + 1) % 200 == 0:
+            print(f"  images {gi + 1}/{len(groups)}  crops={len(rows)}  {time.time() - t0:.0f}s")
+    idx = pd.DataFrame(rows)
+    test = idx[idx.split == "test"]
+    ok = test.groupby("uid").cond.nunique()
+    keep = set(ok[ok == len(conds)].index)                  # visible in EVERY condition
+    idx["complete"] = idx.uid.isin(keep)
+    idx.to_csv(data / "index.csv", index=False)
+    (data / "conditions.json").write_text(json.dumps(conds), encoding="utf-8")
+    print(f"\nRendered {len(idx)} crops; {len(keep)} objects visible in all {len(conds)} conditions.")
+
+
+# =========================================================================== #
+# Stage 3: train + evaluate / 訓練與評估
+# =========================================================================== #
+class CropDS:
+    """Module-level for Windows DataLoader workers. 定義在模組層級以支援 Windows 多程序。"""
+
+    def __init__(self, df: pd.DataFrame, root: Path, frame: str, train: bool, size: int):
+        from torchvision import transforms as T
+
+        norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        self.paths = [root / "crops" / f for f in df["file"]]
+        if frame == "allo":
+            self.y = df[[f"a{i}" for i in range(6)]].to_numpy(np.float32)
+        else:
+            col = {"world": "world_yaw", "cam": "cam_yaw", "alpha": "alpha"}[frame]
+            a = df[col].to_numpy(np.float64)
+            self.y = np.stack([np.sin(a), np.cos(a)], axis=-1).astype(np.float32)
+        # No flips / rotations / translations: they would change the true label.
+        # 不做翻轉、旋轉、平移：它們會改變真實標籤。
+        aug = [T.RandomAffine(degrees=0, scale=(0.9, 1.1)), T.ColorJitter(0.2, 0.2, 0.2)] if train else []
+        self.tf = T.Compose([T.Resize((size, size)), *aug, T.ToTensor(), norm])
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int):
+        import torch
+        from PIL import Image
+
+        return self.tf(Image.open(self.paths[i]).convert("RGB")), torch.from_numpy(self.y[i]), i
+
+
+def torch_R_from_r6(x):
+    import torch
+    import torch.nn.functional as F
+
+    b1 = F.normalize(x[:, :3], dim=1)
+    a2 = x[:, 3:6] - (b1 * x[:, 3:6]).sum(1, keepdim=True) * b1
+    b2 = F.normalize(a2, dim=1)
+    return torch.stack([b1, b2, torch.cross(b1, b2, dim=1)], dim=-1)
+
+
+def loss_fn(frame: str, out, y):
+    import torch.nn.functional as F
+
+    if frame == "allo":
+        return ((torch_R_from_r6(out) - torch_R_from_r6(y)) ** 2).sum((1, 2)).mean()
+    p = F.normalize(out, dim=1)
+    return (1.0 - (p * y).sum(1)).mean()
+
+
+def make_folds(scenes: list[str], n_folds: int, seed: int = 0) -> list[list[str]]:
+    """Identical to Exp 0, so folds match. 與實驗 0 相同，確保切分一致。"""
+    scenes = sorted(scenes)
+    rng = random.Random(seed)
+    rng.shuffle(scenes)
+    n_folds = min(n_folds, len(scenes))
+    return [scenes[i::n_folds] for i in range(n_folds)]
+
+
+def train_model(train_df, root, frame, args, device, seed):
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader
+    from torchvision.models import ResNet18_Weights, resnet18
+
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    m = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if args.pretrained else None)
+    m.fc = nn.Linear(m.fc.in_features, 6 if frame == "allo" else 2)
+    m = m.to(device)
+    opt = torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    dl = DataLoader(CropDS(train_df, root, frame, True, args.size), batch_size=args.bs, shuffle=True,
+                    num_workers=args.workers, pin_memory=device.type == "cuda",
+                    drop_last=len(train_df) > args.bs, persistent_workers=args.workers > 0)
+    for ep in range(args.epochs):
+        m.train()
+        tot = n = 0
+        for x, y, _ in dl:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            loss = loss_fn(frame, m(x), y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item() * len(x); n += len(x)
+        sched.step()
+        if args.verbose:
+            print(f"      epoch {ep + 1}/{args.epochs} loss={tot / max(n, 1):.4f}")
+    return m
+
+
+def predict(m, df, root, frame, args, device) -> np.ndarray:
+    import torch
+    from torch.utils.data import DataLoader
+
+    dl = DataLoader(CropDS(df, root, frame, False, args.size), batch_size=args.bs * 2,
+                    shuffle=False, num_workers=args.workers)
+    out = np.zeros((len(df), 6 if frame == "allo" else 2))
+    m.eval()
+    with torch.no_grad():
+        for x, _, i in dl:
+            out[i.numpy()] = m(x.to(device)).float().cpu().numpy()
+    return out
+
+
+def evaluate(frame, pred, test_df, rng) -> pd.DataFrame:
+    R = tilt_matrices(test_df.pitch.to_numpy(), test_df.roll.to_numpy())
+    noise = np.radians(rng.normal(0, EXT_NOISE_DEG, (len(test_df), 2)))
+    R_noisy = tilt_matrices(test_df.pitch.to_numpy() + np.degrees(noise[:, 0]),
+                            test_df.roll.to_numpy() + np.degrees(noise[:, 1]))
+    gt = test_df.world_yaw.to_numpy() if frame == "world" else test_df.level_yaw.to_numpy()
+    res = []
+    for mode in decoders_for(frame):
+        Rk = {"ext": R, "ext_noisy": R_noisy}.get(mode)
+        yaw = decode(frame, pred, test_df, "ext" if mode == "ext_noisy" else mode, Rk)
+        err = np.degrees(np.abs(wrap(yaw - gt)))
+        res.append(pd.DataFrame({"uid": test_df.uid.values, "cond": test_df.cond.values,
+                                 "pitch": test_df.pitch.values, "roll": test_df.roll.values,
+                                 "decoder": mode, "err_deg": err.round(3)}))
+    return pd.concat(res, ignore_index=True)
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    import torch
+
+    root, out = Path(args.data), Path(args.out)
+    (out / "errors").mkdir(parents=True, exist_ok=True)
+    idx = pd.read_csv(root / "index.csv")
+    idx = idx[idx.complete].reset_index(drop=True)
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(f"Device: {device}   objects: {idx.uid.nunique()}   crops: {len(idx)}")
+    folds = make_folds(idx.scene.unique().tolist(), args.folds)
+    if args.max_folds:
+        folds = folds[:args.max_folds]
+    (out / "folds.json").write_text(json.dumps(folds, indent=2), encoding="utf-8")
+    for k, held in enumerate(folds):
+        tr_all = idx[~idx.scene.isin(held)]
+        test_df = idx[idx.scene.isin(held) & (idx.split == "test")].reset_index(drop=True)
+        for proto in args.protocols or PROTOCOLS:
+            tr = tr_all[tr_all.cond == "p+0_r+0"] if proto == "level" else \
+                tr_all[(tr_all.cond == "p+0_r+0") | (tr_all.split == "aug")]
+            tr = tr.reset_index(drop=True)
+            for frame in args.frames or FRAMES:
+                f = out / "errors" / f"{proto}_{frame}_fold{k}.csv.gz"
+                if f.exists() and not args.overwrite:
+                    print(f"[skip] {f.name}")
+                    continue
+                t0 = time.time()
+                print(f"[fold {k}] {proto:5s} {frame:5s} train={len(tr)} test={len(test_df)}")
+                m = train_model(tr, root, frame, args, device, args.seed + k)
+                pred = predict(m, test_df, root, frame, args, device)
+                ev = evaluate(frame, pred, test_df, np.random.default_rng(args.seed + k))
+                ev.insert(0, "fold", k); ev.insert(0, "frame", frame); ev.insert(0, "protocol", proto)
+                ev.to_csv(f, index=False)
+                lvl = ev[(ev.cond == "p+0_r+0") & (ev.decoder == "none")].err_deg.mean()
+                worst = ev[ev.decoder == "none"].groupby("cond").err_deg.mean().max()
+                print(f"      level err={lvl:.1f}°  worst-tilt err={worst:.1f}°  ({time.time() - t0:.0f}s)")
+    print("\nDone. Next: python pds_exp1.py report --results", out)
+
+
+# =========================================================================== #
+# Stage 4: report / 報告
+# =========================================================================== #
+def tolerance(curve: pd.Series, level: float, factor: float = 1.5) -> float:
+    """Largest |angle| up to which mean error stays <= factor * level error (both signs).
+    誤差維持在水平誤差 factor 倍以內的最大傾斜角（正負兩側都要符合）。"""
+    best = 0.0
+    for a in sorted({abs(x) for x in curve.index if x != 0}):
+        vals = [curve.get(a), curve.get(-a)]
+        if all(v is not None and v <= factor * level for v in vals):
+            best = a
+        else:
+            break
+    return best
+
+
+def cmd_report(args: argparse.Namespace) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    res = Path(args.results)
+    files = sorted((res / "errors").glob("*.csv.gz"))
+    if not files:
+        raise SystemExit("No results yet. Run `run` first.")
+    e = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    e["acc30"] = (e.err_deg <= 30).astype(float)
+    e["method"] = e.frame + "/" + e.decoder
+    lines = ["# PDS Experiment 1 — Label frame × camera tilt / 標籤座標系 × 攝影機傾斜", "",
+             f"Folds: {e.fold.nunique()} · objects per fold avg: {int(e.groupby('fold').uid.nunique().mean())}", ""]
+    for proto in sorted(e.protocol.unique()):
+        ep = e[e.protocol == proto]
+        lines += [f"## Protocol: {proto}", "",
+                  "| method | level err (°) | pitch tolerance (°) | roll tolerance (°) | err @ max pitch | err @ max roll |",
+                  "|---|---|---|---|---|---|"]
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
+        for method, g in ep.groupby("method"):
+            fold_curve = g.groupby(["fold", "pitch", "roll"]).err_deg.mean().reset_index()
+            mean = fold_curve.groupby(["pitch", "roll"]).err_deg.mean()
+            level = mean.get((0.0, 0.0), np.nan)
+            pc = mean.xs(0.0, level="roll")
+            rc = mean.xs(0.0, level="pitch")
+            bp, br = max(abs(x) for x in pc.index), max(abs(x) for x in rc.index)
+            lines.append(f"| {method} | {level:.1f} | {tolerance(pc, level):.0f} | {tolerance(rc, level):.0f} | "
+                         f"{np.nanmean([pc.get(bp), pc.get(-bp)]):.1f} | "
+                         f"{np.nanmean([rc.get(br), rc.get(-br)]):.1f} |")
+            ls = "--" if "ext" in method else "-"
+            axes[0].plot(pc.index, pc.values, ls, marker="o", ms=3, label=method)
+            axes[1].plot(rc.index, rc.values, ls, marker="o", ms=3, label=method)
+        for ax, t in zip(axes, ["pitch (deg)", "roll (deg)"]):
+            ax.set_xlabel(f"camera {t}")
+            ax.grid(alpha=0.3)
+        axes[0].set_ylabel("mean heading error (deg)")
+        axes[1].legend(fontsize=7, ncol=2)
+        fig.suptitle(f"PDS Exp 1 — protocol: {proto}")
+        fig.tight_layout()
+        fig.savefig(res / f"tilt_{proto}.png", dpi=150)
+        plt.close(fig)
+        lines += ["", f"![tilt curves {proto}](tilt_{proto}.png)", ""]
+    lines += ["Tolerance = largest |tilt| at which mean error stays within 1.5× the level error on both sides.",
+              "容忍度 = 兩側平均誤差都維持在水平誤差 1.5 倍以內的最大傾斜角。",
+              "", "`ext` decoders use known extrinsics (upper bound, RQ3); `none`/`grav` do not.",
+              "`ext` 解碼器使用已知外參（上限，RQ3）；`none`／`grav` 不使用外參。"]
+    (res / "summary.md").write_text("\n".join(lines), encoding="utf-8")
+    print("\n".join(lines))
+
+
+# =========================================================================== #
+# Self-test: geometry must be exact before any training / 訓練前先驗證幾何
+# =========================================================================== #
+def cmd_selftest(_args: argparse.Namespace) -> None:
+    rng = np.random.default_rng(0)
+    K = np.array([[1266.0, 0, 816], [0, 1266.0, 491], [0, 0, 1]])
+    n_ok = 0
+
+    def check(name, cond):
+        nonlocal n_ok
+        if not cond:
+            raise AssertionError(f"FAILED: {name}")
+        n_ok += 1
+        print(f"  ok  {name}")
+
+    # 1. Homography = rotating the 3D points. 單應變形 = 旋轉 3D 點。
+    P = rng.uniform([-5, -1, 8], [5, 2, 40], (50, 3)).T
+    R = tilt_matrix(7, -11)
+    uv_rot = (K @ (R @ P))[:2] / (K @ (R @ P))[2]
+    h = K @ R @ np.linalg.inv(K) @ np.vstack([(K @ P)[:2] / (K @ P)[2], np.ones(50)])
+    check("homography matches 3D rotation", np.allclose(h[:2] / h[2], uv_rot, atol=1e-6))
+
+    # 2. 6D round trip and ray rotation. 6D 往返與視線旋轉。
+    Q = np.linalg.qr(rng.normal(size=(20, 3, 3)))[0]
+    Q[np.linalg.det(Q) < 0, :, 2] *= -1
+    check("6D -> R round trip", np.allclose(R_from_r6(r6_from_R(Q)), Q, atol=1e-9))
+    d = pixel_rays(rng.uniform(0, 1600, 20), rng.uniform(0, 900, 20), 1266, 1266, 816, 491)
+    Rr = ray_rotation(d)
+    check("ray rotation maps +z to ray", np.allclose(Rr[:, :, 2], d, atol=1e-9))
+    check("ray rotation is orthonormal", np.allclose(Rr @ Rr.transpose(0, 2, 1), np.eye(3), atol=1e-9))
+
+    # 3. Perfect predictions decode back to the level heading. 完美預測可解碼回水平朝向。
+    n = 200
+    yaw = rng.uniform(-np.pi, np.pi, n)
+    O = np.stack([rot_y_box(y) for y in yaw])           # upright objects at level
+    pitch, roll = rng.uniform(-20, 20, n), rng.uniform(-20, 20, n)
+    Rt = tilt_matrices(pitch, roll)
+    dpx = pixel_rays(rng.uniform(100, 1500, n), rng.uniform(100, 800, n), 1266, 1266, 816, 491)
+    labs = pd.DataFrame([labels_for(Rt[i], O[i], dpx[i]) for i in range(n)])
+    df = pd.DataFrame({"dx": dpx[:, 0], "dy": dpx[:, 1], "dz": dpx[:, 2]})
+    level = yaw_of(O[:, :, 0])
+    check("level yaw = box yaw", np.allclose(wrap(level - yaw), 0, atol=1e-9))
+    sc = lambda a: np.stack([np.sin(a), np.cos(a)], -1)
+    six = labs[[f"a{i}" for i in range(6)]].to_numpy()
+    for fr, p in [("cam", sc(labs.cam_yaw.to_numpy())), ("alpha", sc(labs.alpha.to_numpy())), ("allo", six)]:
+        y = decode(fr, p, df, "ext", Rt)
+        check(f"{fr}: exact extrinsics recover level yaw", np.abs(wrap(y - level)).max() < 1e-6)
+    # Pure pitch and pure roll: object up-axis recovers gravity exactly.
+    for name, pp, rr in [("pitch", pitch, np.zeros(n)), ("roll", np.zeros(n), roll)]:
+        Rs = tilt_matrices(pp, rr)
+        ls = pd.DataFrame([labels_for(Rs[i], O[i], dpx[i]) for i in range(n)])
+        yg = decode("allo", ls[[f"a{i}" for i in range(6)]].to_numpy(), df, "grav")
+        check(f"allo/grav recovers level yaw under pure {name}", np.abs(wrap(yg - level)).max() < 1e-6)
+    # At level, every decoder agrees. 水平時所有解碼一致。
+    l0 = pd.DataFrame([labels_for(np.eye(3), O[i], dpx[i]) for i in range(n)])
+    for fr, p in [("cam", sc(l0.cam_yaw.to_numpy())), ("alpha", sc(l0.alpha.to_numpy())),
+                  ("allo", l0[[f"a{i}" for i in range(6)]].to_numpy())]:
+        check(f"{fr}: level decode without extrinsics is exact",
+              np.abs(wrap(decode(fr, p, df, "none") - level)).max() < 1e-6)
+    # Without extrinsics, tilt must actually hurt a yaw-only frame (sanity). 未知外參時傾斜確實造成誤差。
+    y_none = decode("cam", sc(labs.cam_yaw.to_numpy()), df, "none")
+    check("tilt without extrinsics causes error for cam", np.degrees(np.abs(wrap(y_none - level))).mean() > 0.5)
+    print(f"\nAll {n_ok} geometry checks passed. 全部 {n_ok} 項幾何檢查通過。")
+
+
+def rot_y_box(yaw: float) -> np.ndarray:
+    """Upright box with heading `yaw` in camera frame (y down). 相機座標中直立、朝向為 yaw 的物體。"""
+    h = np.array([math.sin(yaw), 0.0, math.cos(yaw)])
+    up = np.array([0.0, -1.0, 0.0])
+    left = np.cross(up, h)
+    return np.stack([h, left, up], axis=1)
+
+
+# =========================================================================== #
+# CLI
+# =========================================================================== #
+def main() -> None:
+    ap = argparse.ArgumentParser(description="PDS Experiment 1")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("selftest"); s.set_defaults(func=cmd_selftest)
+
+    p = sub.add_parser("prepare")
+    p.add_argument("--dataroot", required=True)
+    p.add_argument("--version", default="v1.0-mini")
+    p.add_argument("--out", default="data")
+    p.add_argument("--category", default="vehicle.car")
+    p.add_argument("--min-size", type=int, default=32)
+    p.add_argument("--min-lidar-pts", type=int, default=5)
+    p.set_defaults(func=cmd_prepare)
+
+    r = sub.add_parser("render")
+    r.add_argument("--data", default="data")
+    r.add_argument("--dataroot", default=None)
+    r.add_argument("--grid", choices=["full", "small"], default="full")
+    r.add_argument("--aug-copies", type=int, default=3)
+    r.add_argument("--size", type=int, default=128)
+    r.add_argument("--min-inside", type=float, default=0.7)
+    r.add_argument("--seed", type=int, default=0)
+    r.set_defaults(func=cmd_render)
+
+    u = sub.add_parser("run")
+    u.add_argument("--data", default="data")
+    u.add_argument("--out", default="results")
+    u.add_argument("--folds", type=int, default=5)
+    u.add_argument("--max-folds", type=int, default=0)
+    u.add_argument("--epochs", type=int, default=12)
+    u.add_argument("--bs", type=int, default=64)
+    u.add_argument("--lr", type=float, default=3e-4)
+    u.add_argument("--size", type=int, default=128)
+    u.add_argument("--workers", type=int, default=2)
+    u.add_argument("--seed", type=int, default=0)
+    u.add_argument("--protocols", nargs="*", choices=PROTOCOLS)
+    u.add_argument("--frames", nargs="*", choices=FRAMES)
+    u.add_argument("--no-pretrained", dest="pretrained", action="store_false")
+    u.add_argument("--cpu", action="store_true")
+    u.add_argument("--overwrite", action="store_true")
+    u.add_argument("--verbose", action="store_true")
+    u.set_defaults(func=cmd_run)
+
+    q = sub.add_parser("report")
+    q.add_argument("--results", default="results")
+    q.set_defaults(func=cmd_report)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
