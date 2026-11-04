@@ -23,3 +23,8 @@ _to_delete/
 exp1/results/ckpt/
 exp1/results/derot/
 exp1/results/derot_noise/
+# A2 and later backbones: keep summary + figure, ignore bulky outputs
+exp1/results_*/errors/
+exp1/results_*/ckpt/
+exp1/results_*/derot/
+exp1/results_*/derot_noise/

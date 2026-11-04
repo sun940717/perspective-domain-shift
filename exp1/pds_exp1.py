@@ -40,6 +40,8 @@ Usage / 用法
     python pds_exp1.py derot   --data data --out results      (A1 mechanism check / 機制檢驗)
     python pds_exp1.py derotnoise --data data --out results   (A1b noisy roll / 含誤差側傾)
     python pds_exp1.py report  --results results
+    A2 (second backbone / 第二種骨幹): add --backbone swin_t --out results_swin_t to run/derot/derotnoise
+    A2b (LR control / 學習率對照): --backbone resnet18 --lr 1e-4 --out results_resnet18_lr1e-4
 
 Python 3.10; needs torch, torchvision, numpy, pandas, pillow, opencv-python, matplotlib
 (+ nuscenes-devkit for `prepare`).
@@ -429,6 +431,29 @@ def make_folds(scenes: list[str], n_folds: int, seed: int = 0) -> list[list[str]
     return [scenes[i::n_folds] for i in range(n_folds)]
 
 
+BACKBONES = ["resnet18", "swin_t", "convnext_tiny"]
+
+
+def build_backbone(name: str, out_dim: int, pretrained: bool):
+    """ResNet-18 (CNN, default), Swin-T (vision transformer) or ConvNeXt-Tiny (modern CNN).
+    ResNet-18（CNN，預設）、Swin-T（視覺 Transformer）或 ConvNeXt-Tiny（新式 CNN）。"""
+    import torch.nn as nn
+    import torchvision.models as tvm
+
+    if name == "resnet18":
+        m = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+        m.fc = nn.Linear(m.fc.in_features, out_dim)
+    elif name == "swin_t":
+        m = tvm.swin_t(weights=tvm.Swin_T_Weights.IMAGENET1K_V1 if pretrained else None)
+        m.head = nn.Linear(m.head.in_features, out_dim)
+    elif name == "convnext_tiny":
+        m = tvm.convnext_tiny(weights=tvm.ConvNeXt_Tiny_Weights.IMAGENET1K_V1 if pretrained else None)
+        m.classifier[2] = nn.Linear(m.classifier[2].in_features, out_dim)
+    else:
+        raise ValueError(name)
+    return m
+
+
 def train_model(train_df, root, frame, args, device, seed):
     import torch
     import torch.nn as nn
@@ -436,8 +461,7 @@ def train_model(train_df, root, frame, args, device, seed):
     from torchvision.models import ResNet18_Weights, resnet18
 
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    m = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if args.pretrained else None)
-    m.fc = nn.Linear(m.fc.in_features, 6 if frame == "allo" else 2)
+    m = build_backbone(getattr(args, "backbone", "resnet18"), 6 if frame == "allo" else 2, args.pretrained)
     m = m.to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -499,7 +523,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     idx = pd.read_csv(root / "index.csv")
     idx = idx[idx.complete].reset_index(drop=True)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    print(f"Device: {device}   objects: {idx.uid.nunique()}   crops: {len(idx)}")
+    print(f"Device: {device}   backbone: {args.backbone}   objects: {idx.uid.nunique()}   crops: {len(idx)}")
+    (out / "backbone.txt").write_text(f"{args.backbone}, lr {args.lr:g}", encoding="utf-8")
     folds = make_folds(idx.scene.unique().tolist(), args.folds)
     if args.max_folds:
         folds = folds[:args.max_folds]
@@ -538,8 +563,7 @@ def load_or_train(path: Path, tr, root, frame, args, device, seed):
     from torchvision.models import resnet18
 
     if path.exists():
-        m = resnet18(weights=None)
-        m.fc = nn.Linear(m.fc.in_features, 6 if frame == "allo" else 2)
+        m = build_backbone(getattr(args, "backbone", "resnet18"), 6 if frame == "allo" else 2, False)
         m.load_state_dict(torch.load(path, map_location=device))
         return m.to(device)
     m = train_model(tr, root, frame, args, device, seed)
@@ -683,7 +707,8 @@ def cmd_report(args: argparse.Namespace) -> None:
     e = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     nf = e.fold.nunique()
     sym = lambda a, axis: [(a, 0.0), (-a, 0.0)] if axis == "pitch" else [(0.0, a), (0.0, -a)]
-    L = ["# PDS Experiment 1 — Label frame × camera tilt / 標籤座標系 × 攝影機傾斜", "",
+    bb = (res / "backbone.txt").read_text(encoding="utf-8").strip() if (res / "backbone.txt").exists() else "resnet18"
+    L = [f"# PDS Experiment 1 — Label frame × camera tilt / 標籤座標系 × 攝影機傾斜 (backbone: {bb})", "",
          f"{nf} folds · {e.uid.nunique()} objects · every number below is PAIRED: error at tilt minus the "
          "same objects' error with a level camera, mean ± std over folds.",
          f"共 {nf} 折、{e.uid.nunique()} 個物體。下表皆為配對差：傾斜下誤差減去同一批物體在水平相機下的誤差（各折平均 ± 標準差）。", ""]
@@ -824,8 +849,20 @@ def cmd_report(args: argparse.Namespace) -> None:
                 r20 = pd.Series({k: (h[(k, 20.0)] + h[(k, -20.0)]) / 2 - base[k] for k in base.index})
                 cells += [ms(lvl), ms(r20)]
             L.append(f"| {fr} | " + " | ".join(cells) + " |")
-        L += ["", "For reference, roll ±20° WITHOUT any de-rotation costs about +19–21° (section 5).",
-              "對照：完全不轉正時，側傾 ±20° 約多出 +19–21°（見第 5 節）。"]
+        ref = ""
+        if dfiles:
+            dd = pd.concat([pd.read_csv(f) for f in dfiles], ignore_index=True)
+            vals = []
+            for fr in ("cam", "alpha", "allo"):
+                g = dd[(dd.frame == fr) & (dd["mode"] == "plain")].assign(pitch=0.0)
+                if len(g):
+                    vals.append(paired_delta(g, [(0.0, 20.0), (0.0, -20.0)]).mean())
+            if vals:
+                lo, hi = min(vals), max(vals)
+                ref = "yes"
+        if ref:
+            L += ["", f"For reference, roll ±20° WITHOUT any de-rotation costs {lo:+.1f} to {hi:+.1f}° with this backbone (section 5).",
+                  f"對照：此骨幹在完全不轉正時，側傾 ±20° 多出 {lo:+.1f}° 至 {hi:+.1f}°（見第 5 節）。"]
     (res / "summary.md").write_text("\n".join(L), encoding="utf-8")
     print("\n".join(L))
 
@@ -948,6 +985,7 @@ def main() -> None:
     u.add_argument("--cpu", action="store_true")
     u.add_argument("--overwrite", action="store_true")
     u.add_argument("--verbose", action="store_true")
+    u.add_argument("--backbone", choices=BACKBONES, default="resnet18")
     u.set_defaults(func=cmd_run)
 
     dr = sub.add_parser("derot", help="A1 mechanism check: de-rotate rolled crops (oracle)")
@@ -966,6 +1004,7 @@ def main() -> None:
     dr.add_argument("--cpu", action="store_true")
     dr.add_argument("--overwrite", action="store_true")
     dr.add_argument("--verbose", action="store_true")
+    dr.add_argument("--backbone", choices=BACKBONES, default="resnet18")
     dr.set_defaults(func=cmd_derot)
 
     dn = sub.add_parser("derotnoise", help="A1b: de-rotation with a noisy roll estimate")
@@ -981,6 +1020,7 @@ def main() -> None:
     dn.add_argument("--cpu", action="store_true")
     dn.add_argument("--overwrite", action="store_true")
     dn.add_argument("--verbose", action="store_true")
+    dn.add_argument("--backbone", choices=BACKBONES, default="resnet18")
     dn.set_defaults(func=cmd_derotnoise)
 
     q = sub.add_parser("report")
