@@ -56,7 +56,21 @@ Level-trained models. `derot` rotates each crop by the TRUE roll before inferenc
 Numbers are extra error vs the same objects with a level camera. A `derot` value near 0 means in-plane rotation explains the roll damage. Rotated crops gain black corners, a small extra handicap.
 數值為與同一批物體水平相機相比多出的誤差。`derot` 接近 0 代表影像平面內旋轉可解釋側傾損害。轉正後的裁切角落會出現黑邊，是一個小額外不利因素。
 
-## 6. A1b de-rotation with a noisy roll estimate / 以含誤差的側傾估計轉正
+## 5b. A1c corner-fill check: black vs mirrored corners / 角落填補檢驗：黑邊 vs 鏡射
+
+Same models and crops as section 5. Rotating a square crop by 20° leaves ~12% of its pixels uncovered; `black` fills them with black (as in section 5), `reflect` with mirrored image content. A real system would de-rotate the whole frame, where such corners do not appear around the object.
+與第 5 節相同的模型與裁切。正方形裁切旋轉 20° 會露出約 12% 的像素；`black` 以黑色填補（同第 5 節），`reflect` 以鏡射影像內容填補。實際系統會轉正整張影像，物體周圍不會出現這種角落。
+
+| frame | roll ±20 plain | derot black | derot reflect | per fold, black | per fold, reflect | folds where reflect is closer to level |
+|---|---|---|---|---|---|---|
+| cam | +8.2 ± 4.2 | +2.3 ± 2.8 | +1.5 ± 1.9 | +2.5, +6.7, -0.5, +0.2, +2.7 | +1.6, +2.6, -1.6, +1.8, +3.1 | 2/5 |
+| alpha | +8.1 ± 1.5 | +2.8 ± 3.4 | +2.8 ± 1.8 | +1.8, +8.8, +1.9, +1.4, -0.0 | +1.2, +5.8, +3.1, +1.6, +2.2 | 2/5 |
+| allo | +9.3 ± 6.3 | -0.2 ± 1.1 | +0.5 ± 2.5 | -1.8, +0.1, +1.4, -0.5, -0.1 | -2.6, -0.8, +4.1, +0.8, +0.8 | 0/5 |
+
+Extra error at roll ±20° vs the same objects with a level camera (mean ± std over folds).
+側傾 ±20° 相對同一批物體水平相機多出的誤差（各折平均 ± 標準差）。
+
+## 6. A1b de-rotation with a noisy roll estimate, black corners / 以含誤差的側傾估計轉正（黑色角落）
 
 Each crop is rotated by (true roll + N(0, σ)); level crops are rotated by the noise alone. Extra error vs the same objects, level camera, NO rotation. Mean ± std over folds.
 每個裁切依（真實側傾 + 常態誤差 σ）旋轉；水平裁切只依誤差旋轉。數值為相對於同一批物體、水平相機、不旋轉時多出的誤差（各折平均 ± 標準差）。
@@ -67,5 +81,16 @@ Each crop is rotated by (true roll + N(0, σ)); level crops are rotated by the n
 | alpha | +0.0 ± 0.0 | +2.8 ± 3.4 | -0.2 ± 1.0 | +2.8 ± 3.6 | -0.7 ± 1.3 | +2.3 ± 3.1 | +1.0 ± 2.4 | +3.3 ± 2.4 |
 | allo | +0.0 ± 0.0 | -0.2 ± 1.1 | +0.3 ± 0.7 | +0.2 ± 1.1 | -0.4 ± 0.6 | -0.5 ± 1.1 | +0.2 ± 1.9 | +0.5 ± 1.3 |
 
+## 6b. A1d the same with mirrored corners / 同上，鏡射角落
+
+Each crop is rotated by (true roll + N(0, σ)); level crops are rotated by the noise alone. Extra error vs the same objects, level camera, NO rotation. Mean ± std over folds.
+每個裁切依（真實側傾 + 常態誤差 σ）旋轉；水平裁切只依誤差旋轉。數值為相對於同一批物體、水平相機、不旋轉時多出的誤差（各折平均 ± 標準差）。
+
+| frame | σ=0° level | σ=0° roll ±20 | σ=1° level | σ=1° roll ±20 | σ=2° level | σ=2° roll ±20 | σ=5° level | σ=5° roll ±20 |
+|---|---|---|---|---|---|---|---|---|
+| cam | +0.0 ± 0.0 | +1.5 ± 1.9 | +0.4 ± 1.2 | +1.6 ± 1.9 | +0.4 ± 1.2 | +1.7 ± 1.9 | +0.7 ± 1.1 | +2.2 ± 2.3 |
+| alpha | +0.0 ± 0.0 | +2.8 ± 1.8 | -0.1 ± 0.7 | +2.9 ± 2.1 | -0.4 ± 0.9 | +2.7 ± 1.6 | +0.7 ± 1.9 | +2.9 ± 1.3 |
+| allo | +0.0 ± 0.0 | +0.5 ± 2.5 | +0.3 ± 0.6 | +0.8 ± 2.5 | -0.4 ± 0.7 | +0.4 ± 2.7 | -0.2 ± 2.1 | +1.5 ± 2.3 |
+
 For reference, roll ±20° WITHOUT any de-rotation costs +8.1 to +9.3° with this backbone (section 5).
-對照：此骨幹在完全不轉正時，側傾 ±20° 多出 +8.1 to +9.3°（見第 5 節）。
+對照：此骨幹在完全不轉正時，側傾 ±20° 多出 +8.1° 至 +9.3°（見第 5 節）。

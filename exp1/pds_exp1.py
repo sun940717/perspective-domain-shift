@@ -42,6 +42,8 @@ Usage / 用法
     python pds_exp1.py report  --results results
     A2 (second backbone / 第二種骨幹): add --backbone swin_t --out results_swin_t to run/derot/derotnoise
     A2b (LR control / 學習率對照): --backbone resnet18 --lr 1e-4 --out results_resnet18_lr1e-4
+    A1c (corner fill / 角落填補): derot --fill reflect (reuses checkpoints; writes derot_reflect/)
+    A1d (noisy roll, mirrored corners / 含誤差＋鏡射): derotnoise --fill reflect (writes derot_noise_reflect/)
 
 Python 3.10; needs torch, torchvision, numpy, pandas, pillow, opencv-python, matplotlib
 (+ nuscenes-devkit for `prepare`).
@@ -52,6 +54,7 @@ import argparse
 import json
 import math
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -370,12 +373,15 @@ class CropDS:
     """Module-level for Windows DataLoader workers. 定義在模組層級以支援 Windows 多程序。"""
 
     def __init__(self, df: pd.DataFrame, root: Path, frame: str, train: bool, size: int,
-                 rotate_deg: np.ndarray | None = None):
+                 rotate_deg: np.ndarray | None = None, fill: str = "black"):
         from torchvision import transforms as T
 
         # rotate_deg: counter-clockwise image rotation per crop (PIL convention). Rotating by +roll
         # undoes a camera roll (verified on synthetic crops). 每個裁切的逆時針旋轉角；+roll 可抵銷相機側傾。
         self.rot = None if rotate_deg is None else np.asarray(rotate_deg, dtype=np.float64)
+        # fill: what the corners uncovered by the rotation show. "black" (PIL default) or "reflect"
+        # (mirrored image content, OpenCV BORDER_REFLECT_101). 旋轉後露出的角落：黑色或鏡射內容。
+        self.fill = fill
 
         norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         self.paths = [root / "crops" / f for f in df["file"]]
@@ -399,7 +405,7 @@ class CropDS:
 
         img = Image.open(self.paths[i]).convert("RGB")
         if self.rot is not None and self.rot[i] != 0:
-            img = img.rotate(float(self.rot[i]), resample=Image.BILINEAR)
+            img = rotate_crop(img, float(self.rot[i]), self.fill)
         return self.tf(img), torch.from_numpy(self.y[i]), i
 
 
@@ -484,11 +490,31 @@ def train_model(train_df, root, frame, args, device, seed):
     return m
 
 
-def predict(m, df, root, frame, args, device, rotate_deg=None) -> np.ndarray:
+def rotate_crop(img, angle: float, fill: str = "black"):
+    """Rotate a PIL image counter-clockwise by `angle` degrees about its centre.
+    "black" uses PIL (corners become black); "reflect" uses OpenCV with mirrored borders. Both use the
+    same centre and direction (checked: interior pixels agree to < 1 grey level).
+    逆時針旋轉影像；black 角落為黑色，reflect 以鏡射內容填補。兩者中心與方向一致（已驗證）。"""
+    from PIL import Image
+
+    if fill == "black":
+        return img.rotate(angle, resample=Image.BILINEAR)
+    if fill == "reflect":
+        import cv2
+
+        a = np.asarray(img)
+        h, w = a.shape[:2]
+        M = cv2.getRotationMatrix2D(((w - 1) / 2, (h - 1) / 2), angle, 1.0)
+        return Image.fromarray(cv2.warpAffine(a, M, (w, h), flags=cv2.INTER_LINEAR,
+                                              borderMode=cv2.BORDER_REFLECT_101))
+    raise ValueError(fill)
+
+
+def predict(m, df, root, frame, args, device, rotate_deg=None, fill="black") -> np.ndarray:
     import torch
     from torch.utils.data import DataLoader
 
-    dl = DataLoader(CropDS(df, root, frame, False, args.size, rotate_deg), batch_size=args.bs * 2,
+    dl = DataLoader(CropDS(df, root, frame, False, args.size, rotate_deg, fill), batch_size=args.bs * 2,
                     shuffle=False, num_workers=args.workers)
     out = np.zeros((len(df), 6 if frame == "allo" else 2))
     m.eval()
@@ -581,7 +607,9 @@ def cmd_derot(args: argparse.Namespace) -> None:
     import torch
 
     root, out = Path(args.data), Path(args.out)
-    (out / "derot").mkdir(parents=True, exist_ok=True)
+    fill = getattr(args, "fill", "black")
+    ddir = out / ("derot" if fill == "black" else f"derot_{fill}")
+    ddir.mkdir(parents=True, exist_ok=True)
     idx = pd.read_csv(root / "index.csv")
     idx = idx[idx.complete].reset_index(drop=True)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -592,7 +620,7 @@ def cmd_derot(args: argparse.Namespace) -> None:
         tr = idx[~idx.scene.isin(held) & (idx.cond == "p+0_r+0")].reset_index(drop=True)
         te = idx[idx.scene.isin(held) & (idx.split == "test") & (idx.pitch == 0)].reset_index(drop=True)
         for frame in args.frames or ["cam", "alpha", "allo"]:
-            f = out / "derot" / f"{frame}_fold{k}.csv.gz"
+            f = ddir / f"{frame}_fold{k}.csv.gz"
             if f.exists() and not args.overwrite:
                 print(f"[skip] {f.name}")
                 continue
@@ -601,7 +629,7 @@ def cmd_derot(args: argparse.Namespace) -> None:
             gt = te.level_yaw.to_numpy()
             parts = []
             for mode, rot in [("plain", None), ("derot", te.roll.to_numpy())]:
-                pred = predict(m, te, root, frame, args, device, rot)
+                pred = predict(m, te, root, frame, args, device, rot, fill)
                 if mode == "derot":
                     # The upright crop now matches the level labels, so decode against the level ray.
                     # 轉正後的裁切對應水平標籤，因此以水平視線解碼。
@@ -616,7 +644,7 @@ def cmd_derot(args: argparse.Namespace) -> None:
             r.insert(0, "fold", k); r.insert(0, "frame", frame)
             r.to_csv(f, index=False)
             g = r.groupby(["mode", "roll"]).err_deg.mean()
-            print(f"[fold {k}] {frame:5s} level={g[('plain', 0.0)]:.1f}  roll±20 plain="
+            print(f"[fold {k}] {frame:5s} fill={fill}  level={g[('plain', 0.0)]:.1f}  roll±20 plain="
                   f"{(g[('plain', 20.0)] + g[('plain', -20.0)]) / 2:.1f}  derot="
                   f"{(g[('derot', 20.0)] + g[('derot', -20.0)]) / 2:.1f}  ({time.time() - t0:.0f}s)")
     print("\nDone. Next: python pds_exp1.py report --results", out)
@@ -631,7 +659,9 @@ def cmd_derotnoise(args: argparse.Namespace) -> None:
     import torch
 
     root, out = Path(args.data), Path(args.out)
-    (out / "derot_noise").mkdir(parents=True, exist_ok=True)
+    fill = getattr(args, "fill", "black")
+    ndir = out / ("derot_noise" if fill == "black" else f"derot_noise_{fill}")
+    ndir.mkdir(parents=True, exist_ok=True)
     idx = pd.read_csv(root / "index.csv")
     idx = idx[idx.complete].reset_index(drop=True)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -645,7 +675,7 @@ def cmd_derotnoise(args: argparse.Namespace) -> None:
         dfd = te[["uid"]].join(lv[["dx", "dy", "dz"]], on="uid")
         gt = te.level_yaw.to_numpy()
         for frame in args.frames or ["cam", "alpha", "allo"]:
-            f = out / "derot_noise" / f"{frame}_fold{k}.csv.gz"
+            f = ndir / f"{frame}_fold{k}.csv.gz"
             if f.exists() and not args.overwrite:
                 print(f"[skip] {f.name}")
                 continue
@@ -655,7 +685,7 @@ def cmd_derotnoise(args: argparse.Namespace) -> None:
             for sigma in args.noise:
                 rng = np.random.default_rng(1000 * k + int(10 * sigma))   # same noise for every frame
                 rot = te.roll.to_numpy() + rng.normal(0.0, sigma, len(te))
-                pred = predict(m, te, root, frame, args, device, rot)
+                pred = predict(m, te, root, frame, args, device, rot, fill)
                 yaw = decode(frame, pred, dfd, "none")
                 parts.append(pd.DataFrame({"uid": te.uid, "roll": te.roll, "sigma": sigma,
                                            "err_deg": np.degrees(np.abs(wrap(yaw - gt))).round(3)}))
@@ -665,7 +695,7 @@ def cmd_derotnoise(args: argparse.Namespace) -> None:
             g = r.groupby(["sigma", "roll"]).err_deg.mean()
             msg = "  ".join(f"s={sg:g}: lvl={g[(sg, 0.0)]:.1f} r20={(g[(sg, 20.0)] + g[(sg, -20.0)]) / 2:.1f}"
                             for sg in args.noise)
-            print(f"[fold {k}] {frame:5s} {msg}  ({time.time() - t0:.0f}s)")
+            print(f"[fold {k}] {frame:5s} fill={fill}  {msg}  ({time.time() - t0:.0f}s)")
     print("\nDone. Next: python pds_exp1.py report --results", out)
 
 
@@ -826,11 +856,49 @@ def cmd_report(args: argparse.Namespace) -> None:
               "in-plane rotation explains the roll damage. Rotated crops gain black corners, a small extra handicap.",
               "數值為與同一批物體水平相機相比多出的誤差。`derot` 接近 0 代表影像平面內旋轉可解釋側傾損害。"
               "轉正後的裁切角落會出現黑邊，是一個小額外不利因素。"]
-    nfiles = sorted((res / "derot_noise").glob("*.csv.gz")) if (res / "derot_noise").exists() else []
-    if nfiles:
+    rfiles = sorted((res / "derot_reflect").glob("*.csv.gz")) if (res / "derot_reflect").exists() else []
+    if rfiles and dfiles:
+        db = pd.concat([pd.read_csv(f) for f in dfiles], ignore_index=True)
+        dr_ = pd.concat([pd.read_csv(f) for f in rfiles], ignore_index=True)
+
+        def r20(g, mode):
+            # Per-fold roll ±20 error minus the same objects' level (plain, roll 0) error.
+            # 各折側傾 ±20 誤差減去同一批物體水平誤差。
+            g = g.assign(pitch=0.0)
+            h = pd.concat([g[(g["mode"] == mode) & (g.roll != 0)], g[(g["mode"] == "plain") & (g.roll == 0)]])
+            return paired_delta(h, [(0.0, 20.0), (0.0, -20.0)])
+
+        L += ["", "## 5b. A1c corner-fill check: black vs mirrored corners / 角落填補檢驗：黑邊 vs 鏡射", "",
+              "Same models and crops as section 5. Rotating a square crop by 20° leaves ~12% of its pixels "
+              "uncovered; `black` fills them with black (as in section 5), `reflect` with mirrored image content. "
+              "A real system would de-rotate the whole frame, where such corners do not appear around the object.",
+              "與第 5 節相同的模型與裁切。正方形裁切旋轉 20° 會露出約 12% 的像素；`black` 以黑色填補（同第 5 節），"
+              "`reflect` 以鏡射影像內容填補。實際系統會轉正整張影像，物體周圍不會出現這種角落。", "",
+              "| frame | roll ±20 plain | derot black | derot reflect | per fold, black | per fold, reflect | folds where reflect is closer to level |",
+              "|---|---|---|---|---|---|---|"]
+        for fr in ("cam", "alpha", "allo"):
+            gb, gr = db[db.frame == fr], dr_[dr_.frame == fr]
+            if not len(gb) or not len(gr):
+                continue
+            pl, bk, rf = r20(gb, "plain"), r20(gb, "derot"), r20(gr, "derot")
+            common = bk.index.intersection(rf.index)
+            better = int((rf[common].abs() < bk[common].abs()).sum())
+            L.append(f"| {fr} | {ms(pl)} | {ms(bk)} | {ms(rf)} | "
+                     + ", ".join(f"{v:+.1f}" for v in bk[common]) + " | "
+                     + ", ".join(f"{v:+.1f}" for v in rf[common]) + f" | {better}/{len(common)} |")
+        L += ["", "Extra error at roll ±20° vs the same objects with a level camera (mean ± std over folds).",
+              "側傾 ±20° 相對同一批物體水平相機多出的誤差（各折平均 ± 標準差）。"]
+    any_noise = False
+    for ndir_name, heading in [
+            ("derot_noise", "## 6. A1b de-rotation with a noisy roll estimate, black corners / 以含誤差的側傾估計轉正（黑色角落）"),
+            ("derot_noise_reflect", "## 6b. A1d the same with mirrored corners / 同上，鏡射角落")]:
+        nfiles = sorted((res / ndir_name).glob("*.csv.gz")) if (res / ndir_name).exists() else []
+        if not nfiles:
+            continue
+        any_noise = True
         d = pd.concat([pd.read_csv(f) for f in nfiles], ignore_index=True)
         sigmas = sorted(d.sigma.unique())
-        L += ["", "## 6. A1b de-rotation with a noisy roll estimate / 以含誤差的側傾估計轉正", "",
+        L += ["", heading, "",
               "Each crop is rotated by (true roll + N(0, σ)); level crops are rotated by the noise alone. "
               "Extra error vs the same objects, level camera, NO rotation. Mean ± std over folds.",
               "每個裁切依（真實側傾 + 常態誤差 σ）旋轉；水平裁切只依誤差旋轉。數值為相對於同一批物體、"
@@ -849,6 +917,7 @@ def cmd_report(args: argparse.Namespace) -> None:
                 r20 = pd.Series({k: (h[(k, 20.0)] + h[(k, -20.0)]) / 2 - base[k] for k in base.index})
                 cells += [ms(lvl), ms(r20)]
             L.append(f"| {fr} | " + " | ".join(cells) + " |")
+    if any_noise:
         ref = ""
         if dfiles:
             dd = pd.concat([pd.read_csv(f) for f in dfiles], ignore_index=True)
@@ -929,6 +998,16 @@ def cmd_selftest(_args: argparse.Namespace) -> None:
     # Without extrinsics, tilt must actually hurt a yaw-only frame (sanity). 未知外參時傾斜確實造成誤差。
     y_none = decode("cam", sc(labs.cam_yaw.to_numpy()), df, "none")
     check("tilt without extrinsics causes error for cam", np.degrees(np.abs(wrap(y_none - level))).mean() > 0.5)
+    try:  # A1c: both corner fills rotate the same way about the same centre
+        import cv2  # noqa: F401
+        from PIL import Image
+
+        img = np.asarray(Image.fromarray((rng.random((64, 64, 3)) * 255).astype(np.uint8)).resize((128, 128)))
+        pb = np.asarray(rotate_crop(Image.fromarray(img), 20.0, "black")).astype(float)
+        pr = np.asarray(rotate_crop(Image.fromarray(img), 20.0, "reflect")).astype(float)
+        check("black and reflect rotations agree inside the crop", np.abs(pb - pr)[40:88, 40:88].mean() < 2.0)
+    except ImportError:
+        print("  --  opencv not installed, skipping rotation-fill check")
     print(f"\nAll {n_ok} geometry checks passed. 全部 {n_ok} 項幾何檢查通過。")
 
 
@@ -944,6 +1023,13 @@ def rot_y_box(yaw: float) -> np.ndarray:
 # CLI
 # =========================================================================== #
 def main() -> None:
+    # Windows: when output is redirected, Python falls back to cp950 and crashes on symbols like "−".
+    # Windows 重新導向輸出時會改用 cp950，遇到「−」等符號會當掉；強制使用 UTF-8。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description="PDS Experiment 1")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -1005,6 +1091,8 @@ def main() -> None:
     dr.add_argument("--overwrite", action="store_true")
     dr.add_argument("--verbose", action="store_true")
     dr.add_argument("--backbone", choices=BACKBONES, default="resnet18")
+    dr.add_argument("--fill", choices=["black", "reflect"], default="black",
+                    help="corner fill after rotation; reflect writes to derot_reflect/ (A1c)")
     dr.set_defaults(func=cmd_derot)
 
     dn = sub.add_parser("derotnoise", help="A1b: de-rotation with a noisy roll estimate")
@@ -1021,6 +1109,8 @@ def main() -> None:
     dn.add_argument("--overwrite", action="store_true")
     dn.add_argument("--verbose", action="store_true")
     dn.add_argument("--backbone", choices=BACKBONES, default="resnet18")
+    dn.add_argument("--fill", choices=["black", "reflect"], default="black",
+                    help="corner fill after rotation; reflect writes to derot_noise_reflect/ (A1d)")
     dn.set_defaults(func=cmd_derotnoise)
 
     q = sub.add_parser("report")

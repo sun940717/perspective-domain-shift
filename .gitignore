@@ -28,3 +28,12 @@ exp1/results_*/errors/
 exp1/results_*/ckpt/
 exp1/results_*/derot/
 exp1/results_*/derot_noise/
+exp1/results/derot_reflect/
+exp1/results_*/derot_reflect/
+
+# Local copy of the /court skill (not part of PDS)
+_court_skill/
+.court/
+exp1/results/derot_noise_reflect/
+exp1/results_*/derot_noise_reflect/
+exp0/nuscenes_trainval/
