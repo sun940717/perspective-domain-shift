@@ -37,3 +37,7 @@ _court_skill/
 exp1/results/derot_noise_reflect/
 exp1/results_*/derot_noise_reflect/
 exp0/nuscenes_trainval/
+exp1/data_trainval/
+exp1/results/derot_est/
+exp1/results_*/derot_est/
+exp1/robogeo/

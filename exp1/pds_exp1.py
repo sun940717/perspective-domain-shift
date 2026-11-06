@@ -236,10 +236,16 @@ def cmd_prepare(args: argparse.Namespace) -> None:
 
     nusc = NuScenes(version=args.version, dataroot=args.dataroot, verbose=True)
     root = Path(args.dataroot).resolve()
-    rows = []
+    rows, used, skipped = [], set(), 0
     for si, sample in enumerate(nusc.sample):
         scene = nusc.get("scene", sample["scene_token"])["name"]
         for cam in CAMS:
+            # A3: only part of trainval may be downloaded; skip images that are not on disk.
+            # A3：trainval 可能只下載了一部分；略過不在硬碟上的影像。
+            if not (root / nusc.get("sample_data", sample["data"][cam])["filename"]).exists():
+                skipped += 1
+                continue
+            used.add(scene)
             img_path, boxes, K = nusc.get_sample_data(sample["data"][cam], box_vis_level=BoxVisibility.ALL)
             K = np.asarray(K)
             for box in boxes:
@@ -251,7 +257,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
                 if box.center[2] <= 0.5:
                     continue
                 cs = view_points(box.corners(), K, normalize=True)[:2]
-                if max(cs[0].ptp(), cs[1].ptp()) < args.min_size:
+                if max(np.ptp(cs[0]), np.ptp(cs[1])) < args.min_size:
                     continue
                 O = box.orientation.rotation_matrix
                 rows.append({
@@ -263,14 +269,17 @@ def cmd_prepare(args: argparse.Namespace) -> None:
                     "w": box.wlh[0], "l": box.wlh[1], "h": box.wlh[2],
                     "world_yaw": float(nusc.get_box(box.token).orientation.yaw_pitch_roll[0]),
                 })
-        if (si + 1) % 50 == 0:
-            print(f"  samples {si + 1}/{len(nusc.sample)}  objects={len(rows)}")
+        if (si + 1) % 1000 == 0:
+            print(f"  samples {si + 1}/{len(nusc.sample)}  scenes with images={len(used)}  objects={len(rows)}")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     meta = pd.DataFrame(rows)
     meta.to_csv(out / "geometry.csv", index=False)
     (out / "dataroot.txt").write_text(str(root), encoding="utf-8")
-    print(f"Saved {len(meta)} objects -> {out / 'geometry.csv'}")
+    print(f"Saved {len(meta)} objects from {len(used)} scenes -> {out / 'geometry.csv'}"
+          f"  ({skipped} camera images not on disk, skipped)")
+    if not len(meta):
+        raise SystemExit("No objects found: check --dataroot and --version.")
 
 
 # =========================================================================== #
@@ -650,6 +659,108 @@ def cmd_derot(args: argparse.Namespace) -> None:
     print("\nDone. Next: python pds_exp1.py report --results", out)
 
 
+def estimate_rolls(data: Path, rolls: list[float], device) -> pd.DataFrame:
+    """C1: estimate each test image's roll with GeoCalib (Veicht et al., ECCV 2024), an
+    off-the-shelf single-image calibration model trained on other data. The full image is
+    tilted exactly as in `render`, a 960x540 window around the principal point (valid for
+    |roll| <= 20 deg, so no black border is visible) is passed with the known focal length.
+    GeoCalib's roll has the opposite sign to ours (checked on nuScenes images), so we negate it.
+    Results are cached in <data>/roll_est.csv and reused by every model set.
+    C1：用 GeoCalib（ECCV 2024，現成、未用我們的資料訓練）從影像估計側傾。整張影像以與 render 相同的方式
+    傾斜，取主點周圍 960x540（側傾 ≤ 20° 時不含黑邊），並提供已知焦距。GeoCalib 的側傾正負號與我們相反
+    （已在 nuScenes 影像上確認），因此取負。結果快取於 <data>/roll_est.csv，供所有模型組共用。"""
+    import cv2
+    import torch
+    from geocalib import GeoCalib
+
+    geo = pd.read_csv(data / "geometry.csv")
+    dataroot = Path((data / "dataroot.txt").read_text(encoding="utf-8").strip())
+    idx = pd.read_csv(data / "index.csv")
+    used = set(idx[idx.complete].uid)
+    imgs = geo[geo.uid.isin(used)].drop_duplicates("img")[["img", "fx", "cx", "cy"]]
+    cache = data / "roll_est.csv"
+    done = pd.read_csv(cache) if cache.exists() else pd.DataFrame(columns=["img", "roll", "est_roll"])
+    have = set(zip(done.img, done.roll.astype(float)))
+    todo = [(r, float(a)) for r in imgs.itertuples(index=False) for a in rolls if (r.img, float(a)) not in have]
+    if not todo:
+        return done
+    print(f"GeoCalib roll estimates: {len(todo)} to compute ({len(have)} cached)")
+    model = GeoCalib().to(device).eval()
+    rows, t0 = [], time.time()
+    for n, (r, a) in enumerate(todo):
+        im = cv2.imread(str(dataroot / r.img))
+        if im is None:
+            raise FileNotFoundError(dataroot / r.img)
+        K = np.array([[r.fx, 0, r.cx], [0, r.fx, r.cy], [0, 0, 1.0]])
+        if a != 0:
+            im = cv2.warpPerspective(im, K @ tilt_matrix(0.0, a) @ np.linalg.inv(K), (im.shape[1], im.shape[0]))
+        cx, cy = int(round(r.cx)), int(round(r.cy))
+        win = im[max(cy - 270, 0):cy + 270, max(cx - 480, 0):cx + 480]
+        t = torch.from_numpy(cv2.cvtColor(win, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().div(255).to(device)
+        with torch.no_grad():
+            out = model.calibrate(t, priors={"focal": torch.tensor([float(r.fx)], device=device)})
+        est = -float(np.degrees(out["gravity"].rp.reshape(-1)[0].item()))
+        rows.append({"img": r.img, "roll": a, "est_roll": round(est, 3)})
+        if (n + 1) % 200 == 0 or n + 1 == len(todo):
+            done = pd.concat([done, pd.DataFrame(rows)], ignore_index=True)
+            done.to_csv(cache, index=False)
+            rows = []
+            print(f"  {n + 1}/{len(todo)}  ({time.time() - t0:.0f}s)")
+    return done
+
+
+def cmd_derotest(args: argparse.Namespace) -> None:
+    """C1: de-rotate with the roll ESTIMATED from the image by GeoCalib, not the true roll.
+    Level crops are also rotated by their own estimate, as a real system would do every frame.
+    Mirrored corners. Writes <out>/derot_est/.
+    C1：以 GeoCalib 從影像「估計」的側傾轉正，而非真實側傾。水平裁切也依其估計值旋轉（實際系統每張都會修正）。
+    鏡射角落。輸出到 <out>/derot_est/。"""
+    import torch
+
+    root, out = Path(args.data), Path(args.out)
+    ddir = out / "derot_est"
+    ddir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    rolls = sorted({0.0, *[float(abs(a)) for a in args.rolls], *[-float(abs(a)) for a in args.rolls]})
+    est = estimate_rolls(root, rolls, device)
+    geo = pd.read_csv(root / "geometry.csv").set_index("uid")
+    idx = pd.read_csv(root / "index.csv")
+    idx = idx[idx.complete].reset_index(drop=True)
+    folds = make_folds(idx.scene.unique().tolist(), args.folds)
+    if args.max_folds:
+        folds = folds[:args.max_folds]
+    est_map = {(i, float(r)): e for i, r, e in zip(est.img, est.roll, est.est_roll)}
+    for k, held in enumerate(folds):
+        tr = idx[~idx.scene.isin(held) & (idx.cond == "p+0_r+0")].reset_index(drop=True)
+        te = idx[idx.scene.isin(held) & (idx.split == "test") & (idx.pitch == 0)
+                 & idx.roll.isin(rolls)].reset_index(drop=True)
+        lv = idx[idx.scene.isin(held) & (idx.cond == "p+0_r+0")].set_index("uid")
+        dfd = te[["uid"]].join(lv[["dx", "dy", "dz"]], on="uid")
+        gt = te.level_yaw.to_numpy()
+        r_hat = np.array([est_map[(geo.at[u, "img"], float(r))] for u, r in zip(te.uid, te.roll)])
+        for frame in args.frames or ["cam", "alpha", "allo"]:
+            f = ddir / f"{frame}_fold{k}.csv.gz"
+            if f.exists() and not args.overwrite:
+                print(f"[skip] {f.name}")
+                continue
+            t0 = time.time()
+            m = load_or_train(out / "ckpt" / f"level_{frame}_fold{k}.pt", tr, root, frame, args, device, args.seed + k)
+            parts = []
+            for mode, rot in [("plain", None), ("derot_est", r_hat)]:
+                pred = predict(m, te, root, frame, args, device, rot, "reflect")
+                yaw = decode(frame, pred, dfd if mode == "derot_est" else te, "none")
+                parts.append(pd.DataFrame({"uid": te.uid, "roll": te.roll, "mode": mode, "est_roll": r_hat,
+                                           "err_deg": np.degrees(np.abs(wrap(yaw - gt))).round(3)}))
+            r = pd.concat(parts, ignore_index=True)
+            r.insert(0, "fold", k); r.insert(0, "frame", frame)
+            r.to_csv(f, index=False)
+            g = r.groupby(["mode", "roll"]).err_deg.mean()
+            print(f"[fold {k}] {frame:5s} level={g[('plain', 0.0)]:.1f}  roll±20 plain="
+                  f"{(g[('plain', 20.0)] + g[('plain', -20.0)]) / 2:.1f}  derot(est)="
+                  f"{(g[('derot_est', 20.0)] + g[('derot_est', -20.0)]) / 2:.1f}  ({time.time() - t0:.0f}s)")
+    print("\nDone. Next: python pds_exp1.py report --results", out)
+
+
 def cmd_derotnoise(args: argparse.Namespace) -> None:
     """A1b: de-rotate with a NOISY roll estimate (roll + N(0, sigma)), as an IMU or horizon
     estimate would give. Level crops (roll 0) are also rotated by the noise alone, since a
@@ -719,6 +830,21 @@ def paired_delta(e: pd.DataFrame, conds: list[tuple[float, float]]) -> pd.Series
     return pd.Series(out, dtype=float)
 
 
+def min_detectable(sd: float, n: int) -> float:
+    """Smallest mean paired difference a two-sided paired t-test (alpha 0.05) detects with 80% power
+    over n folds: (t_0.975 + t_0.80) * sd / sqrt(n). C3 power check.
+    n 折配對 t 檢定（雙尾 alpha 0.05、檢定力 80%）能偵測的最小平均差。"""
+    if n < 2 or not np.isfinite(sd):
+        return float("nan")
+    try:
+        from scipy.stats import t as student_t
+        q = student_t.ppf(0.975, n - 1) + student_t.ppf(0.80, n - 1)
+    except ImportError:  # small table for df = 1..9
+        q = {1: 12.71 + 1.376, 2: 4.303 + 1.061, 3: 3.182 + 0.978, 4: 2.776 + 0.941, 5: 2.571 + 0.920,
+             6: 2.447 + 0.906, 7: 2.365 + 0.896, 8: 2.306 + 0.889, 9: 2.262 + 0.883}.get(n - 1, 1.96 + 0.84)
+    return float(q * sd / np.sqrt(n))
+
+
 def ms(x: pd.Series) -> str:
     if len(x) == 0:
         return "—"
@@ -763,7 +889,10 @@ def cmd_report(args: argparse.Namespace) -> None:
     L += ["## 2. Does the frame change roll robustness? / 座標系是否改變側傾穩健性？", "",
           "Per-fold difference in roll ±20° degradation (negative = first frame more robust).",
           "各折在側傾 ±20° 下退化量的差（負值代表前者較穩健）。", "",
-          "| protocol | comparison | per fold | mean | folds favouring first |", "|---|---|---|---|---|"]
+          "The last column is the smallest mean difference a 5-fold paired t-test could detect (80% power, α = 0.05).",
+          "最後一欄是 5 折配對 t 檢定能偵測的最小平均差（檢定力 80%、α = 0.05）。", "",
+          "| protocol | comparison | per fold | mean ± std | folds favouring first | detectable difference |",
+          "|---|---|---|---|---|---|"]
     for proto in [p for p in PROTOCOLS if p in set(e.protocol)]:
         d = {fr: paired_delta(none[(none.protocol == proto) & (none.frame == fr)], sym(20, "roll"))
              for fr in ("cam", "alpha", "allo") if fr in set(e.frame)}
@@ -771,7 +900,8 @@ def cmd_report(args: argparse.Namespace) -> None:
             if a in d and b in d:
                 diff = d[a] - d[b]
                 L.append(f"| {proto} | {a} − {b} | " + ", ".join(f"{x:+.1f}" for x in diff) +
-                         f" | {diff.mean():+.1f} | {(diff < 0).sum()}/{len(diff)} |")
+                         f" | {ms(diff)} | {(diff < 0).sum()}/{len(diff)} | "
+                         f"±{min_detectable(float(diff.std()), len(diff)):.1f}° |")
     L.append("")
 
     # Table 3: decoders at roll ±20
@@ -856,6 +986,49 @@ def cmd_report(args: argparse.Namespace) -> None:
               "in-plane rotation explains the roll damage. Rotated crops gain black corners, a small extra handicap.",
               "數值為與同一批物體水平相機相比多出的誤差。`derot` 接近 0 代表影像平面內旋轉可解釋側傾損害。"
               "轉正後的裁切角落會出現黑邊，是一個小額外不利因素。"]
+    efiles = sorted((res / "derot_est").glob("*.csv.gz")) if (res / "derot_est").exists() else []
+    if efiles:
+        de_ = pd.concat([pd.read_csv(f) for f in efiles], ignore_index=True)
+        rf_ = (pd.concat([pd.read_csv(f) for f in sorted((res / "derot_reflect").glob("*.csv.gz"))], ignore_index=True)
+               if (res / "derot_reflect").exists() else None)
+
+        def r20e(g, mode):
+            g = g.assign(pitch=0.0)
+            h = pd.concat([g[(g["mode"] == mode) & (g.roll != 0)], g[(g["mode"] == "plain") & (g.roll == 0)]])
+            return paired_delta(h, [(0.0, 20.0), (0.0, -20.0)])
+
+        def lvl_cost(g):
+            a = g[(g["mode"] == "derot_est") & (g.roll == 0)].groupby("fold").err_deg.mean()
+            b = g[(g["mode"] == "plain") & (g.roll == 0)].groupby("fold").err_deg.mean()
+            return (a - b).dropna()
+
+        e0 = de_.drop_duplicates(["uid", "roll"])
+        err20 = (e0[e0.roll.abs() == 20].est_roll - e0[e0.roll.abs() == 20].roll).abs()
+        L += ["", "## 5c. C1 de-rotation with an ESTIMATED roll (GeoCalib) / 以估計的側傾轉正（GeoCalib）", "",
+              "Roll is estimated from the tilted full image by GeoCalib (Veicht et al., ECCV 2024), an off-the-shelf "
+              "single-image calibration model not trained on this data; crops are rotated by the estimate, "
+              "mirrored corners. Level crops are also rotated by their own estimate.",
+              "側傾由 GeoCalib（ECCV 2024，現成、未以本資料訓練）從傾斜後的整張影像估計；裁切依估計值旋轉，鏡射角落。"
+              "水平裁切也依其自身估計值旋轉。", "",
+              f"Roll estimate error at roll ±20°: median {err20.median():.2f}°, mean {err20.mean():.2f}°, "
+              f"95th percentile {err20.quantile(0.95):.2f}° ({len(err20)} crops).",
+              f"側傾 ±20° 的估計誤差：中位數 {err20.median():.2f}°、平均 {err20.mean():.2f}°、"
+              f"第 95 百分位 {err20.quantile(0.95):.2f}°（{len(err20)} 張裁切）。", "",
+              "| frame | roll ±20 plain | true roll (oracle) | estimated roll | level cost of the correction | folds where estimated beats plain |",
+              "|---|---|---|---|---|---|"]
+        for fr in ("cam", "alpha", "allo"):
+            g = de_[de_.frame == fr]
+            if not len(g):
+                continue
+            pl, es = r20e(g, "plain"), r20e(g, "derot_est")
+            orc = "—"
+            if rf_ is not None and len(rf_[rf_.frame == fr]):
+                orc = ms(r20e(rf_[rf_.frame == fr], "derot"))
+            common = pl.index.intersection(es.index)
+            L.append(f"| {fr} | {ms(pl)} | {orc} | {ms(es)} | {ms(lvl_cost(g))} | "
+                     f"{int((es[common] < pl[common]).sum())}/{len(common)} |")
+        L += ["", "Extra error vs the same objects with a level camera and no rotation (mean ± std over folds).",
+              "相對同一批物體、水平相機、不旋轉時多出的誤差（各折平均 ± 標準差）。"]
     rfiles = sorted((res / "derot_reflect").glob("*.csv.gz")) if (res / "derot_reflect").exists() else []
     if rfiles and dfiles:
         db = pd.concat([pd.read_csv(f) for f in dfiles], ignore_index=True)
@@ -1112,6 +1285,22 @@ def main() -> None:
     dn.add_argument("--fill", choices=["black", "reflect"], default="black",
                     help="corner fill after rotation; reflect writes to derot_noise_reflect/ (A1d)")
     dn.set_defaults(func=cmd_derotnoise)
+
+    de = sub.add_parser("derotest", help="C1: de-rotation with the roll estimated by GeoCalib")
+    for a, kw in [("--data", dict(default="data")), ("--out", dict(default="results")),
+                  ("--folds", dict(type=int, default=5)), ("--max-folds", dict(type=int, default=0)),
+                  ("--epochs", dict(type=int, default=12)), ("--bs", dict(type=int, default=64)),
+                  ("--lr", dict(type=float, default=3e-4)), ("--size", dict(type=int, default=128)),
+                  ("--workers", dict(type=int, default=2)), ("--seed", dict(type=int, default=0)),
+                  ("--rolls", dict(type=float, nargs="*", default=[20.0]))]:
+        de.add_argument(a, **kw)
+    de.add_argument("--frames", nargs="*", choices=FRAMES)
+    de.add_argument("--no-pretrained", dest="pretrained", action="store_false")
+    de.add_argument("--cpu", action="store_true")
+    de.add_argument("--overwrite", action="store_true")
+    de.add_argument("--verbose", action="store_true")
+    de.add_argument("--backbone", choices=BACKBONES, default="resnet18")
+    de.set_defaults(func=cmd_derotest)
 
     q = sub.add_parser("report")
     q.add_argument("--results", default="results")

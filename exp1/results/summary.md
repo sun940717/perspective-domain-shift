@@ -24,14 +24,17 @@
 Per-fold difference in roll ±20° degradation (negative = first frame more robust).
 各折在側傾 ±20° 下退化量的差（負值代表前者較穩健）。
 
-| protocol | comparison | per fold | mean | folds favouring first |
-|---|---|---|---|---|
-| level | alpha − cam | -11.4, +17.6, +5.1, -4.2, -0.9 | +1.3 | 3/5 |
-| level | allo − alpha | +1.1, -0.5, -13.2, -1.4, +0.6 | -2.7 | 3/5 |
-| level | allo − cam | -10.3, +17.1, -8.1, -5.6, -0.3 | -1.4 | 4/5 |
-| aug | alpha − cam | +2.9, +18.6, +1.6, +6.7, +0.9 | +6.1 | 0/5 |
-| aug | allo − alpha | +0.0, -9.1, +0.3, -7.9, -0.5 | -3.4 | 3/5 |
-| aug | allo − cam | +2.9, +9.5, +1.9, -1.2, +0.4 | +2.7 | 1/5 |
+The last column is the smallest mean difference a 5-fold paired t-test could detect (80% power, α = 0.05).
+最後一欄是 5 折配對 t 檢定能偵測的最小平均差（檢定力 80%、α = 0.05）。
+
+| protocol | comparison | per fold | mean ± std | folds favouring first | detectable difference |
+|---|---|---|---|---|---|
+| level | alpha − cam | -11.4, +17.6, +5.1, -4.2, -0.9 | +1.3 ± 10.9 | 3/5 | ±18.1° |
+| level | allo − alpha | +1.1, -0.5, -13.2, -1.4, +0.6 | -2.7 ± 5.9 | 3/5 | ±9.9° |
+| level | allo − cam | -10.3, +17.1, -8.1, -5.6, -0.3 | -1.4 ± 11.0 | 4/5 | ±18.3° |
+| aug | alpha − cam | +2.9, +18.6, +1.6, +6.7, +0.9 | +6.1 ± 7.3 | 0/5 | ±12.1° |
+| aug | allo − alpha | +0.0, -9.1, +0.3, -7.9, -0.5 | -3.4 ± 4.6 | 3/5 | ±7.7° |
+| aug | allo − cam | +2.9, +9.5, +1.9, -1.2, +0.4 | +2.7 ± 4.1 | 1/5 | ±6.8° |
 
 ## 3. Does knowing the extrinsics help? / 已知外參是否有幫助？
 
@@ -66,6 +69,23 @@ Level-trained models. `derot` rotates each crop by the TRUE roll before inferenc
 
 Numbers are extra error vs the same objects with a level camera. A `derot` value near 0 means in-plane rotation explains the roll damage. Rotated crops gain black corners, a small extra handicap.
 數值為與同一批物體水平相機相比多出的誤差。`derot` 接近 0 代表影像平面內旋轉可解釋側傾損害。轉正後的裁切角落會出現黑邊，是一個小額外不利因素。
+
+## 5c. C1 de-rotation with an ESTIMATED roll (GeoCalib) / 以估計的側傾轉正（GeoCalib）
+
+Roll is estimated from the tilted full image by GeoCalib (Veicht et al., ECCV 2024), an off-the-shelf single-image calibration model not trained on this data; crops are rotated by the estimate, mirrored corners. Level crops are also rotated by their own estimate.
+側傾由 GeoCalib（ECCV 2024，現成、未以本資料訓練）從傾斜後的整張影像估計；裁切依估計值旋轉，鏡射角落。水平裁切也依其自身估計值旋轉。
+
+Roll estimate error at roll ±20°: median 1.07°, mean 1.31°, 95th percentile 3.18° (3628 crops).
+側傾 ±20° 的估計誤差：中位數 1.07°、平均 1.31°、第 95 百分位 3.18°（3628 張裁切）。
+
+| frame | roll ±20 plain | true roll (oracle) | estimated roll | level cost of the correction | folds where estimated beats plain |
+|---|---|---|---|---|---|
+| cam | +20.5 ± 4.9 | +0.6 ± 3.7 | +0.2 ± 3.5 | -1.0 ± 1.1 | 5/5 |
+| alpha | +19.2 ± 5.7 | +1.0 ± 0.9 | +1.3 ± 1.3 | -0.6 ± 1.0 | 5/5 |
+| allo | +19.0 ± 6.6 | +0.9 ± 2.6 | +1.1 ± 2.3 | -0.1 ± 1.4 | 5/5 |
+
+Extra error vs the same objects with a level camera and no rotation (mean ± std over folds).
+相對同一批物體、水平相機、不旋轉時多出的誤差（各折平均 ± 標準差）。
 
 ## 5b. A1c corner-fill check: black vs mirrored corners / 角落填補檢驗：黑邊 vs 鏡射
 
